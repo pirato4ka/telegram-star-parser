@@ -166,6 +166,21 @@ def channel_title(entity: Any) -> str:
     return str(getattr(entity, "id", "") or "")
 
 
+def build_post_link(entity: Any, message_id: int) -> str:
+    """Строит прямую ссылку на сообщение публичного или приватного канала."""
+    if not message_id or entity is None:
+        return ""
+
+    username = getattr(entity, "username", None)
+    if username:
+        return f"https://t.me/{str(username).lstrip('@')}/{message_id}"
+
+    channel_id = getattr(entity, "id", None)
+    if channel_id is not None:
+        return f"https://t.me/c/{channel_id}/{message_id}"
+    return ""
+
+
 async def get_last_message_id(client: TelegramClient, entity: Any) -> Optional[int]:
     """id последнего сообщения канала (None, если получить не удалось)."""
     try:
@@ -412,6 +427,7 @@ async def build_records_for_message(
     message: Any,
     channel_name: str,
     cache: EntityCache,
+    channel_entity: Any = None,
 ) -> list[StarRecord]:
     """Формирует записи по одному сообщению (пустой список, если звёзд нет)."""
     reactions = getattr(message, "reactions", None)
@@ -422,6 +438,7 @@ async def build_records_for_message(
     is_forward = getattr(message, "fwd_from", None) is not None
     message_type = message_type_with_forward(base_type, is_forward)
     current_id = int(getattr(message, "id", 0) or 0)
+    post_link = build_post_link(channel_entity, current_id)
 
     original_channel, original_id = channel_name, current_id
     if is_forward:
@@ -440,6 +457,7 @@ async def build_records_for_message(
                     reactor_type=REACTOR_ANONYMOUS,
                     current_channel=channel_name,
                     current_message_id=current_id,
+                    post_link=post_link,
                     original_channel=original_channel,
                     original_message_id=original_id,
                     reactor_username="",
@@ -463,6 +481,7 @@ async def build_records_for_message(
                 reactor_type=reactor_type,
                 current_channel=channel_name,
                 current_message_id=current_id,
+                post_link=post_link,
                 original_channel=original_channel,
                 original_message_id=original_id,
                 reactor_username=reactor_name,
@@ -579,7 +598,9 @@ async def parse_channel(
                 continue
 
             try:
-                found = await build_records_for_message(client, message, channel_name, cache)
+                found = await build_records_for_message(
+                    client, message, channel_name, cache, channel_entity=entity
+                )
             except asyncio.CancelledError:
                 raise
             except FloodWaitError as exc:
@@ -613,7 +634,7 @@ async def parse_channel(
 
 __all__ = [
     "ChannelResolutionError", "EntityCache", "PROGRESS_DESCRIPTION",
-    "build_records_for_message", "channel_title", "detect_message_type",
+    "build_post_link", "build_records_for_message", "channel_title", "detect_message_type",
     "get_last_message_id", "get_paid_reactions_total_count",
     "has_paid_reactions", "iter_messages_safe", "iter_paid_reactors",
     "message_type_with_forward", "parse_channel", "parse_channel_input",

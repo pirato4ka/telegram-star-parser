@@ -5,12 +5,13 @@ from __future__ import annotations
 from dataclasses import dataclass, fields
 from typing import Any, Optional
 
-# Порядок колонок в лице `Stars` (совпадает с ТЗ, раздел 6).
+# Порядок колонок в листе `Stars` (совпадает с ТЗ, раздел 6 + ссылка на пост).
 COLUMNS: tuple[str, ...] = (
     "message_type",
     "reactor_type",
     "current_channel",
     "current_message_id",
+    "post_link",
     "original_channel",
     "original_message_id",
     "reactor_username",
@@ -52,6 +53,7 @@ class StarRecord:
     reactor_username: str
     reactor_id: Optional[int]
     stars_count: int
+    post_link: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         """Словарь в порядке `COLUMNS`."""

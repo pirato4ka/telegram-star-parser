@@ -123,6 +123,7 @@ MESSAGES_INTERVAL_MAX=0.1
 | `reactor_type` | `user` / `channel` / `anonymous` / `unknown` |
 | `current_channel` | канал, который парсится (название или username) |
 | `current_message_id` | id поста в этом канале |
+| `post_link` | прямая ссылка на пост/сообщение (`https://t.me/...`), кликабельная гиперссылка в Excel |
 | `original_channel` | канал-источник для пересылок (для обычных постов — как `current_channel`) |
 | `original_message_id` | id сообщения в канале-источнике (для обычных постов — как `current_message_id`) |
 | `reactor_username` | username отправителя (без `@`); если его нет — имя и фамилия; если определить не удалось — `not_found` |
@@ -139,8 +140,9 @@ MESSAGES_INTERVAL_MAX=0.1
 | 1. Точные названия колонок | Оставлены `current_*` / `original_*` из ТЗ (см. таблицу выше) | `models.COLUMNS` |
 | 2. Формат `message_type` для пересылок | `video(forward)` — суффикс `(forward)` | `models.FORWARD_SUFFIX` |
 | 3. `original_*` для непересланных постов | Дублируют `current_*` (канал и id поста) | в `handlers.build_records_for_message` — поставить `""`/`None` |
-| 4. Дополнительные поля | Не добавлены: таблица осталась совпадать с ТЗ. При необходимости дату/ссылку/имя проще всего добавить в `models.StarRecord` + `models.COLUMNS` | `models.py` |
+| 4. Дополнительные поля | Добавлена только ссылка на пост в колонке `post_link`; дата и другие поля не добавлены | `models.py`, `handlers.py` |
 | 5. Файл, если звёзд не найдено | **Не создаётся**, печатается «Звёзды не найдены» | `CREATE_EMPTY_FILE=true` в `[OUTPUT]` или `--create-empty-file` |
+| 6. Ссылка на пост | Добавлена колонка `post_link`; для публичных каналов используется `https://t.me/<username>/<id>`, для приватных — `https://t.me/c/<channel_id>/<id>` | формирование в `handlers.build_post_link` |
 
 ## 7. Ограничения Telegram (важно понимать)
 

@@ -68,6 +68,76 @@ class InterruptingClient(FlowClient):
             raise self.interrupt
 
 
+class QueueClient(FlowClient):
+    """Клиент очереди каналов: у каждого канала свои сообщения.
+
+    `channels` — словарь `username -> (сущность канала, список сообщений)`.
+    Канала, которого нет в словаре, «не существует» (как приватный/удалённый).
+    """
+
+    def __init__(self, channels=None, entities=None, interrupt_on=None):
+        super().__init__(messages=[], entities=entities)
+        self.channels = dict(channels or {})
+        self.interrupt_on = interrupt_on   # username, на котором «нажимают» Ctrl+C
+        self.parsed_order = []
+
+    async def get_entity(self, peer):
+        if isinstance(peer, str):
+            username = peer.lstrip("@")
+            entry = self.channels.get(username)
+            if entry is None:
+                raise ValueError(f"Could not find the input entity for {peer}")
+            return entry[0]
+        return await super().get_entity(peer)
+
+    async def get_messages(self, entity, limit=1, **kwargs):
+        messages = self._messages_of(entity)
+        return messages[:limit]
+
+    async def iter_messages(self, entity, limit=None, offset_id=0, **kwargs):
+        username = getattr(entity, "username", "")
+        self.parsed_order.append(username)
+        if username == self.interrupt_on:
+            raise self._interrupt()
+        selected = self._messages_of(entity)
+        if offset_id:
+            selected = [m for m in selected if int(m.id) < offset_id]
+        for message in selected[:limit] if limit else selected:
+            yield message
+
+    def _messages_of(self, entity):
+        return list(self.channels.get(getattr(entity, "username", ""), (None, []))[1])
+
+    @staticmethod
+    def _interrupt():
+        return KeyboardInterrupt()
+
+
+class QueueCancellingClient(QueueClient):
+    """То же, но настоящая отмена задачи — так Ctrl+C выглядит в asyncio."""
+
+    @staticmethod
+    def _interrupt():
+        return asyncio.CancelledError()
+
+
+class FailingChannelClient(QueueClient):
+    """Каналы из `fail_on` «падают» посреди парсинга: очередь должна продолжиться."""
+
+    def __init__(self, *args, fail_on=(), **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fail_on = set(fail_on)
+
+    async def iter_messages(self, entity, limit=None, offset_id=0, **kwargs):
+        username = getattr(entity, "username", "")
+        if username in self.fail_on:
+            self.parsed_order.append(username)
+            raise RuntimeError("сбой при чтении истории")
+        async for message in super().iter_messages(entity, limit=limit,
+                                                   offset_id=offset_id, **kwargs):
+            yield message
+
+
 class CancellingClient(InterruptingClient):
     """Настоящий Ctrl+C: asyncio.run не бросает KeyboardInterrupt, а отменяет задачу."""
 
@@ -189,6 +259,159 @@ class TestMainFlow(unittest.TestCase):
 
     def test_prompt_count_preset(self):
         self.assertEqual(main_module.prompt_count(7), 7)
+
+
+class TestChannelQueue(TestMainFlow):
+    """Несколько каналов через запятую: очередь, ошибки и Ctrl+C."""
+
+    def _queue_client(self, interrupt_on=None, cancelling=False):
+        paid = make_paid_reactions([types.MessageReactor(count=4,
+                                                         peer_id=types.PeerUser(42))])
+        channels = {
+            "first": (make_channel(11, title="First Channel", username="first"),
+                      [make_message(msg_id=30, text="stars", reactions=paid)]),
+            "second": (make_channel(22, title="Second Channel", username="second"),
+                       [make_message(msg_id=70, text="stars 2", reactions=paid)]),
+        }
+        client_class = QueueCancellingClient if cancelling else QueueClient
+        return client_class(channels=channels,
+                            entities={("user", 42): make_user(42, "ivan")},
+                            interrupt_on=interrupt_on)
+
+    def _files(self, directory=None):
+        return sorted((directory or self.tmp / "output").glob("*.xlsx"))
+
+    @staticmethod
+    def _channel_of(path):
+        sheet = load_workbook(path)["Stars"]
+        column_of = {name: index + 1 for index, name in enumerate(COLUMNS)}
+        return sheet.cell(row=2, column=column_of["current_channel"]).value
+
+    def test_queue_parses_all_channels_in_order(self):
+        client = self._queue_client()
+        self._patch_client(client)
+
+        code = asyncio.run(main_module.run(make_args(channel="@first, t.me/second")))
+
+        self.assertEqual(code, main_module.EXIT_OK)
+        self.assertEqual(client.parsed_order, ["first", "second"])
+        files = self._files()
+        self.assertEqual(len(files), 2)
+        self.assertEqual([self._channel_of(path) for path in files],
+                         ["First Channel", "Second Channel"])
+
+    def test_queue_skips_unresolvable_channel(self):
+        client = self._queue_client()
+        self._patch_client(client)
+
+        code = asyncio.run(main_module.run(make_args(channel="@first, @missing, @second")))
+
+        self.assertEqual(code, main_module.EXIT_OK)
+        self.assertEqual(client.parsed_order, ["first", "second"])
+        self.assertEqual(len(self._files()), 2)
+
+    def test_queue_interrupt_saves_current_channel_only(self):
+        client = self._queue_client(interrupt_on="second")
+        self._patch_client(client)
+
+        code = asyncio.run(main_module.run(make_args(channel="@first, @second", count=10)))
+
+        self.assertEqual(code, main_module.EXIT_INTERRUPTED)
+        files = self._files()
+        self.assertEqual(len(files), 1)
+        self.assertEqual(self._channel_of(files[0]), "First Channel")
+
+    def test_queue_cancellation_saves_current_channel_only(self):
+        client = self._queue_client(interrupt_on="second", cancelling=True)
+        self._patch_client(client)
+
+        code = asyncio.run(main_module.run(make_args(channel="@first, @second", count=10)))
+
+        self.assertEqual(code, main_module.EXIT_INTERRUPTED)
+        files = self._files()
+        self.assertEqual(len(files), 1)
+        self.assertEqual(self._channel_of(files[0]), "First Channel")
+
+    def test_prompt_channels_returns_queue_in_order(self):
+        client = self._queue_client()
+        tasks = asyncio.run(main_module.prompt_channels(client, "@second, @first, @second"))
+        self.assertEqual([task.label for task in tasks], ["Second Channel", "First Channel"])
+
+    def test_prompt_channels_reprompts_when_nothing_resolved(self):
+        client = self._queue_client()
+        original_input = builtins.input
+        builtins.input = lambda *args, **kwargs: "@first"
+        try:
+            tasks = asyncio.run(main_module.prompt_channels(client, "@missing, @gone"))
+        finally:
+            builtins.input = original_input
+        self.assertEqual([task.label for task in tasks], ["First Channel"])
+
+    def test_prompt_channels_reprompts_on_bad_syntax(self):
+        client = self._queue_client()
+        answers = iter(["@first, @", "@first"])
+        original_input = builtins.input
+        builtins.input = lambda *args, **kwargs: next(answers)
+        try:
+            tasks = asyncio.run(main_module.prompt_channels(client, None))
+        finally:
+            builtins.input = original_input
+        self.assertEqual([task.label for task in tasks], ["First Channel"])
+
+    def test_queue_continues_after_channel_error(self):
+        paid = make_paid_reactions([types.MessageReactor(count=4,
+                                                         peer_id=types.PeerUser(42))])
+        channels = {
+            "first": (make_channel(11, title="First Channel", username="first"),
+                      [make_message(msg_id=30, text="stars", reactions=paid)]),
+            "second": (make_channel(22, title="Second Channel", username="second"),
+                       [make_message(msg_id=70, text="stars 2", reactions=paid)]),
+        }
+        client = FailingChannelClient(channels=channels, fail_on={"second"},
+                                      entities={("user", 42): make_user(42, "ivan")})
+        self._patch_client(client)
+
+        code = asyncio.run(main_module.run(make_args(channel="@second, @first")))
+
+        self.assertEqual(code, main_module.EXIT_OK)
+        self.assertEqual(client.parsed_order, ["second", "first"])
+        files = self._files()
+        self.assertEqual(len(files), 1)
+        self.assertEqual(self._channel_of(files[0]), "First Channel")
+
+    def test_queue_all_channels_failed(self):
+        paid = make_paid_reactions([types.MessageReactor(count=4,
+                                                         peer_id=types.PeerUser(42))])
+        channels = {
+            "first": (make_channel(11, title="First Channel", username="first"),
+                      [make_message(msg_id=30, text="stars", reactions=paid)]),
+            "second": (make_channel(22, title="Second Channel", username="second"),
+                       [make_message(msg_id=70, text="stars 2", reactions=paid)]),
+        }
+        client = FailingChannelClient(channels=channels, fail_on={"first", "second"},
+                                      entities={("user", 42): make_user(42, "ivan")})
+        self._patch_client(client)
+
+        code = asyncio.run(main_module.run(make_args(channel="@first, @second")))
+
+        self.assertEqual(code, main_module.EXIT_ERROR)
+        self.assertEqual(self._files(), [])
+
+    def test_queue_exit_code(self):
+        done = main_module.ChannelOutcome(task=main_module.ChannelTask(value="a", name="A"))
+        failed = main_module.ChannelOutcome(task=main_module.ChannelTask(value="b", name="B"),
+                                            status=main_module.STATUS_ERROR, error="boom")
+        self.assertEqual(main_module.queue_exit_code([done], False), main_module.EXIT_OK)
+        self.assertEqual(main_module.queue_exit_code([done, failed], False), main_module.EXIT_OK)
+        self.assertEqual(main_module.queue_exit_code([failed], False), main_module.EXIT_ERROR)
+        self.assertEqual(main_module.queue_exit_code([done], True),
+                         main_module.EXIT_INTERRUPTED)
+
+    def test_summary_counts_all_channels(self):
+        client = self._queue_client()
+        self._patch_client(client)
+        asyncio.run(main_module.run(make_args(channel="@first, @second")))
+        self.assertEqual(len(self._files()), 2)
 
 
 if __name__ == "__main__":

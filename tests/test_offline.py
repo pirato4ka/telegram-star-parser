@@ -26,8 +26,10 @@ from client import ConnectionFailureError, connect  # noqa: E402
 from config import ConfigError, load_config  # noqa: E402
 from exporter import build_result_filename, export_records, safe_filename, unique_path, write_excel  # noqa: E402
 from handlers import (  # noqa: E402
+    ChannelResolutionError,
     EntityCache,
     build_records_for_message,
+    channel_input_text,
     channel_title,
     detect_message_type,
     get_paid_reactions_total_count,
@@ -35,7 +37,9 @@ from handlers import (  # noqa: E402
     message_type_with_forward,
     parse_channel,
     parse_channel_input,
+    parse_channels_input,
     resolve_reactor,
+    split_channel_list,
 )
 from models import COLUMNS, NOT_FOUND, REACTOR_ANONYMOUS, REACTOR_CHANNEL, REACTOR_USER, StarRecord  # noqa: E402
 
@@ -288,6 +292,50 @@ class TestChannelInput(unittest.TestCase):
     def test_empty(self):
         with self.assertRaises(Exception):
             parse_channel_input("   ")
+
+
+# --------------------------------------------------------------------------- #
+# Несколько каналов через запятую (очередь)
+# --------------------------------------------------------------------------- #
+class TestChannelsInput(unittest.TestCase):
+    def test_comma_separated(self):
+        self.assertEqual(parse_channels_input("@durov, t.me/telegram, -1001234567890"),
+                         ["durov", "telegram", -1001234567890])
+
+    def test_order_is_preserved(self):
+        self.assertEqual(parse_channels_input("@c, @a, @b"), ["c", "a", "b"])
+
+    def test_semicolon_and_newline_are_separators_too(self):
+        self.assertEqual(parse_channels_input("@a;@b\n@c"), ["a", "b", "c"])
+
+    def test_duplicates_removed_case_insensitive(self):
+        self.assertEqual(parse_channels_input("@durov, durov, t.me/DUROV"), ["durov"])
+
+    def test_empty_parts_are_ignored(self):
+        self.assertEqual(parse_channels_input("  @a ,, , @b ,  "), ["a", "b"])
+
+    def test_invite_links_survive_split(self):
+        self.assertEqual(parse_channels_input("t.me/+abcdefghijklmnopq, @durov"),
+                         ["https://t.me/+abcdefghijklmnopq", "durov"])
+
+    def test_only_separators(self):
+        with self.assertRaises(ChannelResolutionError):
+            parse_channels_input("  ,, ; ")
+
+    def test_bad_item_reports_which_one(self):
+        with self.assertRaises(ChannelResolutionError) as ctx:
+            parse_channels_input("@durov, @")
+        self.assertIn("'@'", str(ctx.exception))
+
+    def test_split_channel_list(self):
+        self.assertEqual(split_channel_list(" @a , b ;\nc "), ["@a", "b", "c"])
+        self.assertEqual(split_channel_list(""), [])
+
+    def test_channel_input_text(self):
+        self.assertEqual(channel_input_text("durov"), "@durov")
+        self.assertEqual(channel_input_text(-1001234567890), "-1001234567890")
+        self.assertEqual(channel_input_text("https://t.me/+abcdefghijklmnopq"),
+                         "https://t.me/+abcdefghijklmnopq")
 
 
 # --------------------------------------------------------------------------- #

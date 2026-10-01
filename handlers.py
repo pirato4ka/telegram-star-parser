@@ -97,6 +97,10 @@ _LINK_RE = re.compile(
     r"^(?:https?://)?(?:www\.)?(?:t\.me|telegram\.me|telegram\.dog)/(.+)$", re.IGNORECASE
 )
 
+# Разделители списка каналов: запятая (основной), точка с запятой, перевод строки.
+# В ссылках и username запятых не бывает, поэтому делить по ним безопасно.
+CHANNEL_SEPARATORS_RE = re.compile(r"[,;\n\r]+")
+
 
 class ChannelResolutionError(Exception):
     """Канал не найден, удалён, приватен или введён некорректно."""
@@ -153,6 +157,57 @@ def parse_channel_input(raw: str) -> Union[str, int]:
     if not text:
         raise ChannelResolutionError(f"Не удалось разобрать ввод: {raw!r}")
     return text
+
+
+def split_channel_list(raw: str) -> list[str]:
+    """Разбивает ввод пользователя на отдельные каналы.
+
+    Разделители: запятая (основной), точка с запятой и перевод строки — удобно
+    вставлять список каналов из блокнота. Пустые элементы отбрасываются,
+    порядок ввода сохраняется.
+    """
+    parts: list[str] = []
+    for part in CHANNEL_SEPARATORS_RE.split(raw or ""):
+        part = part.strip().strip('"\'').strip()
+        if part:
+            parts.append(part)
+    return parts
+
+
+def parse_channels_input(raw: str) -> list[Union[str, int]]:
+    """Разбирает несколько каналов, перечисленных через запятую.
+
+    Пример: `@durov, t.me/telegram, -1001234567890`. Каждый элемент разбирается
+    правилами `parse_channel_input`. Пустые элементы отбрасываются, повторы
+    (без учёта регистра username) учитываются один раз, порядок ввода
+    сохраняется — он же порядок очереди парсинга.
+    """
+    parts = split_channel_list(raw)
+    if not parts:
+        raise ChannelResolutionError(
+            "Пустой ввод. Укажите каналы через запятую: @durov, t.me/telegram"
+        )
+
+    values: list[Union[str, int]] = []
+    seen: set[Union[str, int]] = set()
+    for part in parts:
+        try:
+            value = parse_channel_input(part)
+        except ChannelResolutionError as exc:
+            raise ChannelResolutionError(f"{exc} (элемент списка: {part!r})") from exc
+        key = value.lower() if isinstance(value, str) else value
+        if key in seen:
+            continue
+        seen.add(key)
+        values.append(value)
+    return values
+
+
+def channel_input_text(value: Union[str, int]) -> str:
+    """Как показать разобранный канал в консоли: username — с `@`, ссылки/id — как есть."""
+    if isinstance(value, str) and not value.lower().startswith(("http://", "https://")):
+        return f"@{value.lstrip('@')}"
+    return str(value)
 
 
 async def resolve_channel(client: TelegramClient, value: Union[str, int]) -> Any:
@@ -1146,6 +1201,10 @@ async def parse_channel(
     channel_name = channel_title(entity)
     chunk = int(batch_size or speed.batch_size_for(limit))
     started = time.monotonic()
+    # Один троттлинг может обслуживать очередь из нескольких каналов, поэтому
+    # в статистику прохода берутся только запросы/ожидания этого прохода.
+    requests_before = throttle.requests
+    slept_before = throttle.slept
 
     with tqdm(total=max(limit, 0), desc=PROGRESS_DESCRIPTION, unit="сообщ.",
               dynamic_ncols=True, leave=True) as progress:
@@ -1161,8 +1220,8 @@ async def parse_channel(
                 )
 
     stats.elapsed = time.monotonic() - started
-    stats.api_requests = throttle.requests
-    stats.waited = throttle.slept
+    stats.api_requests = max(0, throttle.requests - requests_before)
+    stats.waited = max(0.0, throttle.slept - slept_before)
 
     rate = stats.scanned / stats.elapsed if stats.elapsed else 0.0
     logger.info(
@@ -1177,11 +1236,12 @@ async def parse_channel(
 __all__ = [
     "ChannelResolutionError", "EntityCache", "PROGRESS_DESCRIPTION",
     "WARMUP_DESCRIPTION", "build_post_link", "build_records_for_message",
-    "channel_title", "collect_message_peers", "detect_message_type",
-    "get_last_message_id", "get_paid_reactions_total_count",
-    "has_paid_reactions", "iter_message_batches", "iter_messages_safe",
-    "iter_paid_reactors", "local_input_peer", "message_type_with_forward",
-    "parse_channel", "parse_channel_input", "process_message_batch",
+    "channel_input_text", "channel_title", "collect_message_peers",
+    "detect_message_type", "get_last_message_id",
+    "get_paid_reactions_total_count", "has_paid_reactions",
+    "iter_message_batches", "iter_messages_safe", "iter_paid_reactors",
+    "local_input_peer", "message_type_with_forward", "parse_channel",
+    "parse_channel_input", "parse_channels_input", "process_message_batch",
     "resolve_channel", "resolve_forward_source", "resolve_reactor",
-    "send_request", "warmup_participants",
+    "send_request", "split_channel_list", "warmup_participants",
 ]

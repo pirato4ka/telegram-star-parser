@@ -22,6 +22,7 @@ from openpyxl import load_workbook  # noqa: E402
 from telethon.errors import FloodWaitError  # noqa: E402
 from telethon.tl import types  # noqa: E402
 
+from client import ConnectionFailureError, connect  # noqa: E402
 from config import ConfigError, load_config  # noqa: E402
 from exporter import build_result_filename, export_records, safe_filename, unique_path, write_excel  # noqa: E402
 from handlers import (  # noqa: E402
@@ -29,6 +30,7 @@ from handlers import (  # noqa: E402
     build_records_for_message,
     channel_title,
     detect_message_type,
+    get_paid_reactions_total_count,
     has_paid_reactions,
     message_type_with_forward,
     parse_channel,
@@ -430,6 +432,38 @@ class TestReactors(unittest.TestCase):
         self.assertFalse(has_paid_reactions(None))
         self.assertFalse(has_paid_reactions(make_message().reactions))
 
+    def test_paid_reactions_total_count(self):
+        self.assertEqual(get_paid_reactions_total_count(None), 0)
+        self.assertEqual(get_paid_reactions_total_count(types.MessageReactions(results=[])), 0)
+        self.assertEqual(get_paid_reactions_total_count(types.MessageReactions(
+            results=[types.ReactionCount(reaction=types.ReactionEmoji(emoticon="❤️"), count=5)]
+        )), 0)
+        self.assertEqual(get_paid_reactions_total_count(types.MessageReactions(
+            results=[
+                types.ReactionCount(reaction=types.ReactionEmoji(emoticon="❤️"), count=5),
+                types.ReactionCount(reaction=types.ReactionPaid(), count=25),
+            ]
+        )), 25)
+
+    def test_build_records_paid_without_reactors_fallback_anonymous(self):
+        client = FakeClient()
+        reactions = types.MessageReactions(
+            results=[types.ReactionCount(reaction=types.ReactionPaid(), count=15)],
+            top_reactors=[],
+        )
+        message = make_message(msg_id=101, text="exclusive post", reactions=reactions)
+        records = self.run_async(
+            build_records_for_message(client, message, "My Channel", self.cache)
+        )
+        self.assertEqual(len(records), 1)
+        record = records[0]
+        self.assertEqual(record.reactor_type, REACTOR_ANONYMOUS)
+        self.assertEqual(record.reactor_id, None)
+        self.assertEqual(record.reactor_username, "")
+        self.assertEqual(record.stars_count, 15)
+        self.assertEqual(record.current_message_id, 101)
+        self.assertEqual(record.current_channel, "My Channel")
+
     def test_build_records_simple_post(self):
         client = FakeClient(entities={("user", 42): make_user(42, "ivan")})
         message = make_message(
@@ -591,6 +625,46 @@ class TestExport(unittest.TestCase):
             path = export_records(sample_records(), Path(tmp), "C" * 500)
             assert path is not None
             self.assertLessEqual(len(path.name), 130)
+
+
+class TestClientConnect(unittest.TestCase):
+    """Тесты функции подключения client.connect()."""
+
+    def test_connect_sync_is_connected(self):
+        class MockClientSync:
+            def __init__(self):
+                self.connected = False
+            async def connect(self):
+                self.connected = True
+            def is_connected(self) -> bool:
+                return self.connected
+
+        client = MockClientSync()
+        asyncio.run(connect(client, attempts=1))
+        self.assertTrue(client.connected)
+
+    def test_connect_async_is_connected(self):
+        class MockClientAsync:
+            def __init__(self):
+                self.connected = False
+            async def connect(self):
+                self.connected = True
+            async def is_connected(self):
+                return self.connected
+
+        client = MockClientAsync()
+        asyncio.run(connect(client, attempts=1))
+        self.assertTrue(client.connected)
+
+    def test_connect_failure_raises(self):
+        class MockClientFail:
+            async def connect(self):
+                pass
+            def is_connected(self) -> bool:
+                return False
+
+        with self.assertRaises(ConnectionFailureError):
+            asyncio.run(connect(MockClientFail(), attempts=1))
 
 
 if __name__ == "__main__":

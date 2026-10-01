@@ -354,6 +354,17 @@ def has_paid_reactions(reactions: Any) -> bool:
     return False
 
 
+def get_paid_reactions_total_count(reactions: Any) -> int:
+    """Возвращает суммарное количество звёзд из ReactionPaid в results."""
+    if reactions is None:
+        return 0
+    total = 0
+    for result in getattr(reactions, "results", None) or []:
+        if isinstance(getattr(result, "reaction", None), types.ReactionPaid):
+            total += int(getattr(result, "count", 0) or 0)
+    return total
+
+
 def iter_paid_reactors(reactions: Any) -> Iterable[types.MessageReactor]:
     """Возвращает отправителей платных реакций (top_reactors)."""
     if reactions is None:
@@ -407,10 +418,6 @@ async def build_records_for_message(
     if not has_paid_reactions(reactions):
         return []
 
-    reactors = iter_paid_reactors(reactions)
-    if not reactors:
-        return []
-
     base_type = detect_message_type(message)
     is_forward = getattr(message, "fwd_from", None) is not None
     message_type = message_type_with_forward(base_type, is_forward)
@@ -421,6 +428,26 @@ async def build_records_for_message(
         source_name, source_id = await resolve_forward_source(client, message, cache)
         original_channel = source_name or channel_name
         original_id = source_id if source_id is not None else current_id
+
+    reactors = iter_paid_reactors(reactions)
+    if not reactors:
+        # Платные реакции есть, но список top_reactors пуст (все реакции скрыты/анонимны)
+        total_stars = get_paid_reactions_total_count(reactions)
+        if total_stars > 0:
+            return [
+                StarRecord(
+                    message_type=message_type,
+                    reactor_type=REACTOR_ANONYMOUS,
+                    current_channel=channel_name,
+                    current_message_id=current_id,
+                    original_channel=original_channel,
+                    original_message_id=original_id,
+                    reactor_username="",
+                    reactor_id=None,
+                    stars_count=total_stars,
+                )
+            ]
+        return []
 
     records: list[StarRecord] = []
     for reactor in reactors:
@@ -587,8 +614,9 @@ async def parse_channel(
 __all__ = [
     "ChannelResolutionError", "EntityCache", "PROGRESS_DESCRIPTION",
     "build_records_for_message", "channel_title", "detect_message_type",
-    "get_last_message_id", "has_paid_reactions", "iter_messages_safe",
-    "iter_paid_reactors", "message_type_with_forward", "parse_channel",
-    "parse_channel_input", "resolve_channel", "resolve_forward_source",
-    "resolve_reactor", "warmup_participants",
+    "get_last_message_id", "get_paid_reactions_total_count",
+    "has_paid_reactions", "iter_messages_safe", "iter_paid_reactors",
+    "message_type_with_forward", "parse_channel", "parse_channel_input",
+    "resolve_channel", "resolve_forward_source", "resolve_reactor",
+    "warmup_participants",
 ]

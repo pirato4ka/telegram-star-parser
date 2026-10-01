@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import inspect
 import logging
 import sys
 from pathlib import Path
@@ -190,7 +191,9 @@ async def run(args: argparse.Namespace) -> int:
     finally:
         if client is not None:
             try:
-                await client.disconnect()
+                res = client.disconnect()
+                if inspect.isawaitable(res):
+                    await res
             except Exception:  # pragma: no cover - disconnect не должен ломать выход
                 logger.debug("Ошибка при отключении клиента", exc_info=True)
 

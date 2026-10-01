@@ -22,6 +22,7 @@ from openpyxl import load_workbook  # noqa: E402
 from telethon.errors import FloodWaitError  # noqa: E402
 from telethon.tl import types  # noqa: E402
 
+from client import ConnectionFailureError, connect  # noqa: E402
 from config import ConfigError, load_config  # noqa: E402
 from exporter import build_result_filename, export_records, safe_filename, unique_path, write_excel  # noqa: E402
 from handlers import (  # noqa: E402
@@ -624,6 +625,46 @@ class TestExport(unittest.TestCase):
             path = export_records(sample_records(), Path(tmp), "C" * 500)
             assert path is not None
             self.assertLessEqual(len(path.name), 130)
+
+
+class TestClientConnect(unittest.TestCase):
+    """Тесты функции подключения client.connect()."""
+
+    def test_connect_sync_is_connected(self):
+        class MockClientSync:
+            def __init__(self):
+                self.connected = False
+            async def connect(self):
+                self.connected = True
+            def is_connected(self) -> bool:
+                return self.connected
+
+        client = MockClientSync()
+        asyncio.run(connect(client, attempts=1))
+        self.assertTrue(client.connected)
+
+    def test_connect_async_is_connected(self):
+        class MockClientAsync:
+            def __init__(self):
+                self.connected = False
+            async def connect(self):
+                self.connected = True
+            async def is_connected(self):
+                return self.connected
+
+        client = MockClientAsync()
+        asyncio.run(connect(client, attempts=1))
+        self.assertTrue(client.connected)
+
+    def test_connect_failure_raises(self):
+        class MockClientFail:
+            async def connect(self):
+                pass
+            def is_connected(self) -> bool:
+                return False
+
+        with self.assertRaises(ConnectionFailureError):
+            asyncio.run(connect(MockClientFail(), attempts=1))
 
 
 if __name__ == "__main__":

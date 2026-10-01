@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import getpass
+import inspect
 from pathlib import Path
 from typing import Optional
 
@@ -90,7 +91,10 @@ async def connect(client: TelegramClient, attempts: int = CONNECT_ATTEMPTS) -> N
     for attempt in range(1, attempts + 1):
         try:
             await client.connect()
-            if await client.is_connected():
+            connected = client.is_connected()
+            if inspect.isawaitable(connected):
+                connected = await connected
+            if connected:
                 return
             last_error = RuntimeError("не удалось установить соединение")
         except CONNECTION_ERRORS as exc:

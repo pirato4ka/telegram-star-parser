@@ -21,7 +21,17 @@ MESSAGES_INTERVAL_MIN=0.05
 MESSAGES_INTERVAL_MAX=0.1
 ```
 
-Дополнительные (необязательные) секции: [PARSER], [OUTPUT] — см. `DEFAULTS`.
+Дополнительные (необязательные) секции: [SPEED], [PARSER], [PROXY], [OUTPUT].
+
+```ini
+[SPEED]
+PER_REQUEST_DELAY=true     ; пауза из [DELAY] — между запросами, а не сообщениями
+HISTORY_WAIT_TIME=0        ; 0 — не ждать между пачками истории, auto — как в Telethon
+MESSAGE_BATCH=500          ; сколько сообщений обрабатывать одной пачкой
+ENTITY_BATCH=200           ; сколько отправителей получать одним запросом (лимит API 200)
+CONCURRENCY=3              ; одновременных запросов к API
+RESOLVE_UNKNOWN_PEERS=true ; пачкой пробовать пользователей без access_hash в кэше
+```
 """
 
 from __future__ import annotations
@@ -31,6 +41,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from speed import (
+    DEFAULT_CONCURRENCY,
+    DEFAULT_ENTITY_BATCH,
+    DEFAULT_MESSAGE_BATCH,
+    MAX_CONCURRENCY,
+    MAX_ENTITY_BATCH,
+    MAX_MESSAGE_BATCH,
+    MIN_MESSAGE_BATCH,
+    SpeedProfile,
+)
 from utils import get_logger
 
 CONFIG_FILE_NAME = "conf.ini"
@@ -56,6 +76,13 @@ DEFAULT_PROXY_RDNS = True
 
 DEFAULT_WARMUP_PARTICIPANTS = False
 DEFAULT_WARMUP_LIMIT = 10000
+
+# Скорость: пауза только между реальными запросами, история без лишних ожиданий,
+# отправители звёзд — пачками до 200 сущностей за запрос.
+DEFAULT_PER_REQUEST_DELAY = True
+DEFAULT_HISTORY_WAIT_TIME = 0.0
+DEFAULT_RESOLVE_UNKNOWN_PEERS = True
+HISTORY_WAIT_TIME_AUTO = "auto"
 
 DEFAULT_MAX_ATTEMPTS = 3
 
@@ -84,6 +111,14 @@ _DEFAULTS: dict[str, dict[str, str]] = {
         "USERNAME": "",
         "PASSWORD": "",
         "RDNS": str(DEFAULT_PROXY_RDNS),
+    },
+    "SPEED": {
+        "PER_REQUEST_DELAY": str(DEFAULT_PER_REQUEST_DELAY),
+        "HISTORY_WAIT_TIME": str(DEFAULT_HISTORY_WAIT_TIME),
+        "MESSAGE_BATCH": str(DEFAULT_MESSAGE_BATCH),
+        "ENTITY_BATCH": str(DEFAULT_ENTITY_BATCH),
+        "CONCURRENCY": str(DEFAULT_CONCURRENCY),
+        "RESOLVE_UNKNOWN_PEERS": str(DEFAULT_RESOLVE_UNKNOWN_PEERS),
     },
     "OUTPUT": {
         "DIR": DEFAULT_OUTPUT_DIR,
@@ -184,6 +219,7 @@ class AppConfig:
     session: SessionSettings = field(default_factory=SessionSettings)
     delay: DelaySettings = field(default_factory=DelaySettings)
     parser: ParserSettings = field(default_factory=ParserSettings)
+    speed: SpeedProfile = field(default_factory=SpeedProfile)
     proxy: ProxySettings = field(default_factory=ProxySettings)
     output: OutputSettings = field(default_factory=OutputSettings)
     config_path: Optional[Path] = None
@@ -219,6 +255,24 @@ def _get_float(parser: configparser.ConfigParser, section: str, option: str,
     except ValueError as exc:
         raise ConfigError(
             f"Параметр [{section}] {option} должен быть числом, получено: {raw!r}"
+        ) from exc
+
+
+def _get_optional_float(parser: configparser.ConfigParser, section: str, option: str,
+                        default: Optional[float],
+                        auto_keyword: str = HISTORY_WAIT_TIME_AUTO) -> Optional[float]:
+    """Число, `auto` (-> None) или пустое значение (-> default)."""
+    raw = _get(parser, section, option)
+    if not raw:
+        return default
+    if raw.strip().lower() in (auto_keyword, "default", "telethon"):
+        return None
+    try:
+        return float(raw.replace(",", "."))
+    except ValueError as exc:
+        raise ConfigError(
+            f"Параметр [{section}] {option} должен быть числом или `{auto_keyword}`, "
+            f"получено: {raw!r}"
         ) from exc
 
 
@@ -344,6 +398,26 @@ def load_config(base_dir: Path, config_path: Optional[Path] = None) -> AppConfig
         max_attempts=max(1, _get_int(parser, "PARSER", "MAX_ATTEMPTS", DEFAULT_MAX_ATTEMPTS)),
     )
 
+    # ---------------- [SPEED] ----------------
+    history_wait_time = _get_optional_float(parser, "SPEED", "HISTORY_WAIT_TIME",
+                                            DEFAULT_HISTORY_WAIT_TIME)
+    if history_wait_time is not None and history_wait_time < 0:
+        raise ConfigError("[SPEED] HISTORY_WAIT_TIME не может быть отрицательным.")
+    speed = SpeedProfile(
+        per_request_delay=_get_bool(parser, "SPEED", "PER_REQUEST_DELAY",
+                                    DEFAULT_PER_REQUEST_DELAY),
+        history_wait_time=history_wait_time,
+        message_batch=min(MAX_MESSAGE_BATCH,
+                          max(MIN_MESSAGE_BATCH,
+                              _get_int(parser, "SPEED", "MESSAGE_BATCH", DEFAULT_MESSAGE_BATCH))),
+        entity_batch=min(MAX_ENTITY_BATCH,
+                         max(1, _get_int(parser, "SPEED", "ENTITY_BATCH", DEFAULT_ENTITY_BATCH))),
+        concurrency=min(MAX_CONCURRENCY,
+                        max(1, _get_int(parser, "SPEED", "CONCURRENCY", DEFAULT_CONCURRENCY))),
+        resolve_unknown_peers=_get_bool(parser, "SPEED", "RESOLVE_UNKNOWN_PEERS",
+                                        DEFAULT_RESOLVE_UNKNOWN_PEERS),
+    )
+
     # ---------------- [PROXY] ----------------
     proxy_type = (_get(parser, "PROXY", "TYPE") or DEFAULT_PROXY_TYPE).lower()
     if proxy_type not in ("socks5", "socks4", "http", "https"):
@@ -383,6 +457,7 @@ def load_config(base_dir: Path, config_path: Optional[Path] = None) -> AppConfig
         session=session,
         delay=delay,
         parser=parser_settings,
+        speed=speed,
         proxy=proxy,
         output=output,
         config_path=path,
@@ -413,6 +488,6 @@ def ensure_output_dir(base_dir: Path, directory: str) -> Path:
 __all__ = [
     "ApiCredentials", "AppConfig", "ConfigError", "DelaySettings",
     "OutputSettings", "ParserSettings", "ProxySettings", "SessionSettings",
-    "CONFIG_FILE_NAME", "ensure_output_dir", "find_config_file",
-    "load_config", "session_file_path",
+    "CONFIG_FILE_NAME", "HISTORY_WAIT_TIME_AUTO", "ensure_output_dir",
+    "find_config_file", "load_config", "session_file_path",
 ]

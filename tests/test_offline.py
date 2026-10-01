@@ -595,11 +595,14 @@ class TestExport(unittest.TestCase):
             self.assertEqual(sheet.max_row, 3)
 
             # id остаются целыми числами (не float и не экспоненциальная запись)
-            self.assertEqual(sheet.cell(row=2, column=4).value, 100)
-            self.assertIsInstance(sheet.cell(row=2, column=4).value, int)
-            self.assertEqual(sheet.cell(row=2, column=8).value, 42)
-            self.assertIsInstance(sheet.cell(row=2, column=8).value, int)
-            self.assertIsNone(sheet.cell(row=3, column=8).value)   # анонимный отправитель
+            id_column = COLUMNS.index("current_message_id") + 1
+            reactor_id_column = COLUMNS.index("reactor_id") + 1
+            self.assertEqual(sheet.cell(row=2, column=id_column).value, 100)
+            self.assertIsInstance(sheet.cell(row=2, column=id_column).value, int)
+            self.assertEqual(sheet.cell(row=2, column=reactor_id_column).value, 42)
+            self.assertIsInstance(sheet.cell(row=2, column=reactor_id_column).value, int)
+            # анонимный отправитель — без id
+            self.assertIsNone(sheet.cell(row=3, column=reactor_id_column).value)
 
     def test_no_records_no_file(self):
         with tempfile.TemporaryDirectory() as tmp:

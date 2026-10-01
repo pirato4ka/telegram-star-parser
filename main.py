@@ -144,6 +144,9 @@ async def run(args: argparse.Namespace) -> int:
     stats = ParseStats()
     client: Optional[TelegramClient] = None
     channel_name = "channel"
+    # Пауза из [DELAY] применяется между реальными запросами к API, а не между
+    # сообщениями: посты без звёзд и уже известные донаторы не ждут вовсе.
+    throttle = config.speed.throttle(config.delay.as_tuple())
 
     try:
         client = build_client(config, base_dir)
@@ -158,7 +161,7 @@ async def run(args: argparse.Namespace) -> int:
 
         entity = await prompt_channel(client, args.channel)
         channel_name = channel_title(entity)
-        last_id = await get_last_message_id(client, entity)
+        last_id = await get_last_message_id(client, entity, throttle=throttle)
         print(f"(id последнего сообщения: {last_id if last_id is not None else 'не определён'})")
 
         if args.count is not None:
@@ -170,11 +173,15 @@ async def run(args: argparse.Namespace) -> int:
             count = prompt_count()
         stats.requested = count
 
-        cache = EntityCache()
+        cache = EntityCache(entity_batch=config.speed.entity_batch,
+                            concurrency=config.speed.concurrency,
+                            resolve_unknown_peers=config.speed.resolve_unknown_peers)
         warmup = args.warmup if args.warmup is not None else config.parser.warmup_participants
         if warmup:
-            print("Прогрев кэша: загружаем участников группы обсуждения...")
-            cached = await warmup_participants(client, entity, config.parser.warmup_limit)
+            print(f"Прогрев кэша: загружаем до {config.parser.warmup_limit} участников "
+                  "группы обсуждения...")
+            cached = await warmup_participants(client, entity, config.parser.warmup_limit,
+                                               throttle=throttle)
             print(f"В кэш сессии загружено участников: {cached}")
 
         print(f"\nАнализируем {count} последних постов канала «{channel_name}»...\n")
@@ -183,8 +190,12 @@ async def run(args: argparse.Namespace) -> int:
             delay=config.delay.as_tuple(),
             cache=cache,
             stats=stats,
+            speed=config.speed,
+            throttle=throttle,
         )
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        # Ctrl+C: asyncio отменяет задачу, поэтому ловим и отмену тоже —
+        # иначе собранные данные не будут сохранены.
         stats.interrupted = True
         print("\nПарсинг прерван пользователем (Ctrl+C). Сохраняем собранные данные...")
         logger.warning("Парсинг прерван пользователем. Собрано записей: %d", len(records))

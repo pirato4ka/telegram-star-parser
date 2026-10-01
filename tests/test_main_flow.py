@@ -21,6 +21,7 @@ from openpyxl import load_workbook  # noqa: E402
 from telethon.tl import types  # noqa: E402
 
 import main as main_module  # noqa: E402
+from models import COLUMNS  # noqa: E402
 from test_offline import (  # noqa: E402
     FakeClient, make_channel, make_message, make_paid_reactions, make_user,
 )
@@ -59,10 +60,18 @@ class FlowClient(FakeClient):
 class InterruptingClient(FlowClient):
     """Клиент, имитирующий Ctrl+C после первого сообщения."""
 
+    interrupt = KeyboardInterrupt
+
     async def iter_messages(self, entity, limit=None, offset_id=0, **kwargs):
         for message in self.messages:
             yield message
-            raise KeyboardInterrupt
+            raise self.interrupt
+
+
+class CancellingClient(InterruptingClient):
+    """Настоящий Ctrl+C: asyncio.run не бросает KeyboardInterrupt, а отменяет задачу."""
+
+    interrupt = asyncio.CancelledError
 
 
 def make_args(**overrides) -> argparse.Namespace:
@@ -117,9 +126,10 @@ class TestMainFlow(unittest.TestCase):
         self.assertEqual(len(files), 1)
         sheet = load_workbook(files[0])["Stars"]
         self.assertEqual(sheet.max_row, 2)            # шапка + одна запись
-        self.assertEqual(sheet.cell(row=2, column=4).value, 30)   # current_message_id
-        self.assertEqual(sheet.cell(row=2, column=7).value, "ivan")
-        self.assertEqual(sheet.cell(row=2, column=9).value, 4)
+        column_of = {name: index + 1 for index, name in enumerate(COLUMNS)}
+        self.assertEqual(sheet.cell(row=2, column=column_of["current_message_id"]).value, 30)
+        self.assertEqual(sheet.cell(row=2, column=column_of["reactor_username"]).value, "ivan")
+        self.assertEqual(sheet.cell(row=2, column=column_of["stars_count"]).value, 4)
 
     def test_run_without_stars_prints_message(self):
         client = FlowClient(messages=[make_message(msg_id=1, text="no stars")])
@@ -142,6 +152,22 @@ class TestMainFlow(unittest.TestCase):
         self.assertEqual(len(files), 1)
         sheet = load_workbook(files[0])["Stars"]
         self.assertEqual(sheet.max_row, 2)
+
+    def test_cancellation_saves_partial_data(self):
+        """Ctrl+C в реальной жизни — это отмена задачи, данные всё равно сохраняются."""
+        client = CancellingClient(messages=self._messages(),
+                                  entities={("user", 42): make_user(42, "ivan")})
+        self._patch_client(client)
+
+        code = asyncio.run(main_module.run(make_args(count=10)))
+
+        self.assertEqual(code, main_module.EXIT_INTERRUPTED)
+        files = list((self.tmp / "output").glob("*.xlsx"))
+        self.assertEqual(len(files), 1)
+        sheet = load_workbook(files[0])["Stars"]
+        self.assertEqual(sheet.max_row, 2)
+        column_of = {name: index + 1 for index, name in enumerate(COLUMNS)}
+        self.assertEqual(sheet.cell(row=2, column=column_of["reactor_username"]).value, "ivan")
 
     def test_output_dir_from_argument(self):
         client = FlowClient(messages=self._messages(),

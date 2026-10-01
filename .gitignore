@@ -1,0 +1,27 @@
+# Конфигурация и сессии — не коммитим
+conf.ini
+*.session
+*.session-journal
+
+# Результаты работы
+output/
+*.xlsx
+parser.log
+*.log
+
+# Сборка
+build/
+dist/
+*.pyc
+__pycache__/
+
+# Окружение
+.venv/
+venv/
+.env
+
+# Прочее
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

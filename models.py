@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass, fields
 from typing import Any, Optional
 
+from utils import format_seconds
+
 # Порядок колонок в листе `Stars` (совпадает с ТЗ, раздел 6 + ссылка на пост).
 COLUMNS: tuple[str, ...] = (
     "message_type",
@@ -81,6 +83,16 @@ class ParseStats:
     reactors: int = 0          # всего записей (пар «пост + отправитель»)
     errors: int = 0            # ошибок, которые удалось пережить
     interrupted: bool = False  # парсинг прерван пользователем (Ctrl+C)
+    # --- скорость (заполняются при парсинге) ---
+    api_requests: int = 0      # сетевых запросов к Telegram за прогон
+    not_found: int = 0         # записей, где отправителя не удалось расшифровать
+    elapsed: float = 0.0       # время парсинга, сек
+    waited: float = 0.0        # суммарное ожидание между запросами, сек
+
+    @property
+    def rate(self) -> float:
+        """Скорость парсинга, сообщений в секунду."""
+        return self.scanned / self.elapsed if self.elapsed > 0 else 0.0
 
     def as_text(self) -> str:
         """Краткая сводка для консоли."""
@@ -90,8 +102,19 @@ class ParseStats:
             f"Постов со звёздами: {self.with_stars}",
             f"Записей в таблице: {self.reactors}",
         ]
+        if self.not_found:
+            lines.append(
+                f"Не расшифровано отправителей (not_found): {self.not_found} "
+                "(помогает прогрев кэша: --warmup)"
+            )
         if self.errors:
             lines.append(f"Ошибок при обработке (см. parser.log): {self.errors}")
+        if self.elapsed > 0:
+            lines.append(
+                f"Время парсинга: {format_seconds(self.elapsed)} "
+                f"({self.rate:.0f} сообщ./с, сетевых запросов: {self.api_requests}, "
+                f"ожидание между запросами: {format_seconds(self.waited)})"
+            )
         if self.interrupted:
             lines.append("Внимание: парсинг прерван пользователем, сохранены собранные данные.")
         return "\n".join(lines)

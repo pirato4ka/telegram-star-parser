@@ -4,6 +4,10 @@
 Запуск:
     python main.py
     python main.py --channel @durov --count 200
+    python main.py --channel "@durov, t.me/telegram, -1001234567890" -n 500
+
+Несколько каналов перечисляются через запятую: они становятся в очередь и
+обрабатываются по очереди, для каждого сохраняется свой Excel-файл.
 
 Рядом с приложением должен лежать `conf.ini` (см. `conf.example.ini`).
 """
@@ -15,8 +19,9 @@ import asyncio
 import inspect
 import logging
 import sys
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional, Union
 
 from telethon import TelegramClient
 
@@ -26,26 +31,34 @@ from exporter import export_records
 from handlers import (
     ChannelResolutionError,
     EntityCache,
+    channel_input_text,
     channel_title,
     get_last_message_id,
     parse_channel,
-    parse_channel_input,
+    parse_channels_input,
     resolve_channel,
     warmup_participants,
 )
 from models import ParseStats, StarRecord
+from speed import RequestThrottle
 from utils import get_base_dir, get_logger, reconfigure_console_encoding, setup_logger
 
 APP_TITLE = "Парсер звёзд (Paid Reactions) в постах Telegram-канала"
 
 EXIT_OK = 0
+EXIT_ERROR = 1
 EXIT_CONFIG_ERROR = 2
 EXIT_AUTH_ERROR = 3
 EXIT_CONNECTION_ERROR = 4
 EXIT_INTERRUPTED = 130
 
-PROMPT_CHANNEL = "Введите наименование/id канала: "
+PROMPT_CHANNEL = "Введите наименование/id канала (или несколько через запятую): "
 PROMPT_COUNT = "Введите количество последних постов для анализа: "
+
+# Итог обработки одного канала из очереди.
+STATUS_DONE = "ok"
+STATUS_ERROR = "error"
+STATUS_CANCELLED = "cancelled"
 
 
 # --------------------------------------------------------------------------- #
@@ -61,9 +74,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("-c", "--config", type=Path, default=None,
                         help="путь к conf.ini (по умолчанию — рядом с приложением)")
     parser.add_argument("--channel", default=None,
-                        help="канал: @username, ссылка t.me/..., числовой id (-100...)")
+                        help="канал: @username, ссылка t.me/..., числовой id (-100...); "
+                             "несколько каналов — через запятую (обрабатываются по очереди)")
     parser.add_argument("-n", "--count", type=int, default=None,
-                        help="сколько последних постов анализировать")
+                        help="сколько последних постов анализировать (для каждого канала)")
     parser.add_argument("--output-dir", default=None,
                         help="каталог для Excel (по умолчанию из [OUTPUT] DIR)")
     parser.add_argument("--warmup", action="store_true", default=None,
@@ -79,31 +93,87 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 # --------------------------------------------------------------------------- #
+# Очередь каналов
+# --------------------------------------------------------------------------- #
+@dataclass(slots=True)
+class ChannelTask:
+    """Канал в очереди: как его ввели, что получилось после разбора и сущность."""
+
+    value: Union[str, int]
+    entity: Any = None
+    name: str = ""
+
+    @property
+    def label(self) -> str:
+        """Название для консоли: title канала, иначе username/ссылка/id."""
+        return self.name or channel_input_text(self.value)
+
+
+@dataclass(slots=True)
+class ChannelOutcome:
+    """Результат обработки одного канала из очереди."""
+
+    task: ChannelTask
+    status: str = STATUS_DONE
+    records: int = 0
+    scanned: int = 0
+    with_stars: int = 0
+    path: Optional[Path] = None
+    error: str = ""
+
+
+# --------------------------------------------------------------------------- #
 # Интерактивный ввод
 # --------------------------------------------------------------------------- #
-async def prompt_channel(client: TelegramClient, preset: Optional[str] = None) -> object:
-    """Запрашивает канал, пока не получит корректную сущность."""
+async def prompt_channels(client: TelegramClient,
+                          preset: Optional[str] = None) -> list[ChannelTask]:
+    """Запрашивает канал(ы) и возвращает готовую очередь на парсинг.
+
+    Каналы перечисляются через запятую: `@durov, t.me/telegram, -1001234567890`.
+    Каждый канал разбирается и сразу получается его сущность. Каналы, которые не
+    удалось получить, в очередь не попадают — об этом сообщается, а остальные
+    продолжают обрабатываться. Если не получен ни один канал, ввод запрашивается
+    заново (синтаксическая ошибка в списке тоже приводит к повторному вводу).
+    """
+    logger = get_logger("main")
     while True:
         raw = preset if preset is not None else input(PROMPT_CHANNEL).strip()
         preset = None
         if not raw:
-            print("Пустой ввод. Пример: @channelname, t.me/channelname или -1001234567890")
+            print("Пустой ввод. Пример: @durov, t.me/telegram или -1001234567890")
             continue
+
         try:
-            value = parse_channel_input(raw)
+            values = parse_channels_input(raw)
         except ChannelResolutionError as exc:
             print(f"{exc} Попробуйте снова.")
             continue
-        try:
-            entity = await resolve_channel(client, value)
-        except ChannelResolutionError as exc:
-            print(f"{exc} Попробуйте снова.")
+
+        tasks: list[ChannelTask] = []
+        failed: list[tuple[str, str]] = []
+        for value in values:
+            try:
+                entity = await resolve_channel(client, value)
+            except ChannelResolutionError as exc:
+                failed.append((channel_input_text(value), str(exc)))
+                continue
+            except Exception as exc:  # сеть и прочие нештатные ситуации
+                logger.exception("Ошибка поиска канала %r: %s", value, exc)
+                failed.append((channel_input_text(value), str(exc)))
+                continue
+            tasks.append(ChannelTask(value=value, entity=entity, name=channel_title(entity)))
+
+        for name, error in failed:
+            print(f"Канал {name} пропущен: {error}")
+        if not tasks:
+            print("Не удалось получить ни один канал. Попробуйте снова.")
             continue
-        except Exception as exc:  # сеть и прочие нештатные ситуации
-            get_logger("main").exception("Ошибка поиска канала %r: %s", raw, exc)
-            print(f"Не удалось получить канал ({exc}). Попробуйте снова.")
-            continue
-        return entity
+        if failed:
+            print(f"В очереди останется {len(tasks)} из {len(values)} каналов.")
+        if len(tasks) > 1:
+            names = ", ".join(task.label for task in tasks)
+            print(f"В очереди {len(tasks)} каналов: {names}")
+        return tasks
 
 
 def prompt_count(preset: Optional[int] = None) -> int:
@@ -124,102 +194,63 @@ def prompt_count(preset: Optional[int] = None) -> int:
 
 
 # --------------------------------------------------------------------------- #
-# Оркестрация
+# Один канал из очереди
 # --------------------------------------------------------------------------- #
-async def run(args: argparse.Namespace) -> int:
-    """Основной сценарий: конфиг -> авторизация -> канал -> парсинг -> Excel."""
-    logger = get_logger("main")
-    base_dir = get_base_dir()
+async def parse_one_channel(
+    client: TelegramClient,
+    task: ChannelTask,
+    count: int,
+    config: AppConfig,
+    args: argparse.Namespace,
+    throttle: RequestThrottle,
+    records: list[StarRecord],
+    stats: ParseStats,
+) -> ParseStats:
+    """Парсит один канал очереди: последний id -> прогрев кэша -> сообщения.
 
-    try:
-        config = load_config(base_dir, args.config)
-    except ConfigError as exc:
-        print(f"Ошибка конфигурации:\n{exc}")
-        return EXIT_CONFIG_ERROR
+    Список `records` и объект `stats` принадлежат вызывающему коду (очереди) и
+    заполняются по ходу работы — поэтому при прерывании (Ctrl+C) уже собранные
+    данные этого канала можно сохранить.
+    """
+    stats.requested = int(count)
 
-    print(APP_TITLE)
-    print(f"Конфигурация: {config.config_path}")
+    last_id = await get_last_message_id(client, task.entity, throttle=throttle)
+    print(f"(id последнего сообщения: {last_id if last_id is not None else 'не определён'})")
 
-    records: list[StarRecord] = []
-    stats = ParseStats()
-    client: Optional[TelegramClient] = None
-    channel_name = "channel"
-    # Пауза из [DELAY] применяется между реальными запросами к API, а не между
-    # сообщениями: посты без звёзд и уже известные донаторы не ждут вовсе.
-    throttle = config.speed.throttle(config.delay.as_tuple())
+    cache = EntityCache(entity_batch=config.speed.entity_batch,
+                        concurrency=config.speed.concurrency,
+                        resolve_unknown_peers=config.speed.resolve_unknown_peers)
+    warmup = args.warmup if args.warmup is not None else config.parser.warmup_participants
+    if warmup:
+        print(f"Прогрев кэша: загружаем до {config.parser.warmup_limit} участников "
+              "группы обсуждения...")
+        cached = await warmup_participants(client, task.entity, config.parser.warmup_limit,
+                                           throttle=throttle)
+        print(f"В кэш сессии загружено участников: {cached}")
 
-    try:
-        client = build_client(config, base_dir)
-        try:
-            await authorize(client, config, max_attempts=config.parser.max_attempts)
-        except ConnectionFailureError as exc:
-            print(f"Ошибка подключения: {exc}")
-            return EXIT_CONNECTION_ERROR
-        except AuthError as exc:
-            print(f"Ошибка авторизации: {exc}")
-            return EXIT_AUTH_ERROR
-
-        entity = await prompt_channel(client, args.channel)
-        channel_name = channel_title(entity)
-        last_id = await get_last_message_id(client, entity, throttle=throttle)
-        print(f"(id последнего сообщения: {last_id if last_id is not None else 'не определён'})")
-
-        if args.count is not None:
-            if args.count <= 0:
-                print("Количество постов (--count) должно быть больше 0.")
-                return EXIT_CONFIG_ERROR
-            count = args.count
-        else:
-            count = prompt_count()
-        stats.requested = count
-
-        cache = EntityCache(entity_batch=config.speed.entity_batch,
-                            concurrency=config.speed.concurrency,
-                            resolve_unknown_peers=config.speed.resolve_unknown_peers)
-        warmup = args.warmup if args.warmup is not None else config.parser.warmup_participants
-        if warmup:
-            print(f"Прогрев кэша: загружаем до {config.parser.warmup_limit} участников "
-                  "группы обсуждения...")
-            cached = await warmup_participants(client, entity, config.parser.warmup_limit,
-                                               throttle=throttle)
-            print(f"В кэш сессии загружено участников: {cached}")
-
-        print(f"\nАнализируем {count} последних постов канала «{channel_name}»...\n")
-        stats = await parse_channel(
-            client, entity, count, records,
-            delay=config.delay.as_tuple(),
-            cache=cache,
-            stats=stats,
-            speed=config.speed,
-            throttle=throttle,
-        )
-    except (KeyboardInterrupt, asyncio.CancelledError):
-        # Ctrl+C: asyncio отменяет задачу, поэтому ловим и отмену тоже —
-        # иначе собранные данные не будут сохранены.
-        stats.interrupted = True
-        print("\nПарсинг прерван пользователем (Ctrl+C). Сохраняем собранные данные...")
-        logger.warning("Парсинг прерван пользователем. Собрано записей: %d", len(records))
-    finally:
-        if client is not None:
-            try:
-                res = client.disconnect()
-                if inspect.isawaitable(res):
-                    await res
-            except Exception:  # pragma: no cover - disconnect не должен ломать выход
-                logger.debug("Ошибка при отключении клиента", exc_info=True)
-
-    return save_results(records, stats, channel_name, config, args, base_dir)
+    print(f"\nАнализируем {count} последних постов канала «{task.label}»...\n")
+    return await parse_channel(
+        client, task.entity, count, records,
+        delay=config.delay.as_tuple(),
+        cache=cache,
+        stats=stats,
+        speed=config.speed,
+        throttle=throttle,
+    )
 
 
-def save_results(
+# --------------------------------------------------------------------------- #
+# Сохранение результата
+# --------------------------------------------------------------------------- #
+def save_channel(
     records: list[StarRecord],
     stats: ParseStats,
     channel_name: str,
     config: AppConfig,
     args: argparse.Namespace,
     base_dir: Path,
-) -> int:
-    """Сохраняет Excel и печатает итог. Возвращает код завершения."""
+) -> Optional[Path]:
+    """Сохраняет Excel одного канала и печатает итог прохода. Возвращает путь."""
     logger = get_logger("main")
     output_dir_value = args.output_dir if args.output_dir else config.output.directory
     try:
@@ -251,10 +282,191 @@ def save_results(
         print("Данных для сохранения нет.")
     else:
         print(stats.as_text())
+    return path
 
-    if stats.interrupted:
+
+# --------------------------------------------------------------------------- #
+# Очередь: последовательная обработка каналов
+# --------------------------------------------------------------------------- #
+async def parse_queue(
+    client: TelegramClient,
+    tasks: list[ChannelTask],
+    count: int,
+    config: AppConfig,
+    args: argparse.Namespace,
+    throttle: RequestThrottle,
+    base_dir: Path,
+    outcomes: Optional[list[ChannelOutcome]] = None,
+) -> tuple[list[ChannelOutcome], bool]:
+    """Обрабатывает каналы по очереди; возвращает итоги и признак прерывания.
+
+    Ошибка одного канала не останавливает очередь: он помечается как `error`,
+    а обработка продолжается со следующего. Ctrl+C сохраняет данные текущего
+    канала и останавливает очередь (необработанные каналы помечаются).
+
+    Итоги дописываются в переданный список `outcomes`, поэтому прогресс очереди
+    виден вызывающему коду даже при непредвиденном прерывании.
+    """
+    logger = get_logger("main")
+    if outcomes is None:
+        outcomes = []
+    interrupted = False
+    total = len(tasks)
+
+    for index, task in enumerate(tasks):
+        outcome = ChannelOutcome(task=task)
+        records: list[StarRecord] = []
+        stats = ParseStats(requested=count)
+        if total > 1:
+            print(f"\n===== Канал {index + 1} из {total}: «{task.label}» =====")
+
+        try:
+            stats = await parse_one_channel(client, task, count, config, args,
+                                            throttle, records, stats)
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            # Ctrl+C: asyncio отменяет задачу, поэтому ловим и отмену тоже —
+            # иначе собранные данные не будут сохранены.
+            stats.interrupted = True
+            interrupted = True
+            print("\nПарсинг прерван пользователем (Ctrl+C). Сохраняем собранные данные...")
+            logger.warning("Парсинг прерван пользователем. Канал %s, записей: %d",
+                           task.label, len(records))
+            outcome.status = STATUS_CANCELLED
+            outcome.path = save_channel(records, stats, task.label, config, args, base_dir)
+            outcome.records, outcome.scanned = len(records), stats.scanned
+            outcome.with_stars = stats.with_stars
+            outcomes.append(outcome)
+            for pending in tasks[index + 1:]:
+                outcomes.append(ChannelOutcome(
+                    task=pending, status=STATUS_CANCELLED,
+                    error="не обработан: очередь прервана пользователем",
+                ))
+            break
+        except Exception as exc:  # канал не остановит остальные в очереди
+            logger.exception("Ошибка парсинга канала %s: %s", task.label, exc)
+            print(f"\nНе удалось обработать канал «{task.label}»: {exc}. "
+                  "Переходим к следующему.")
+            outcome.status = STATUS_ERROR
+            outcome.error = str(exc)
+            outcomes.append(outcome)
+            continue
+
+        outcome.path = save_channel(records, stats, task.label, config, args, base_dir)
+        outcome.records, outcome.scanned = len(records), stats.scanned
+        outcome.with_stars = stats.with_stars
+        outcomes.append(outcome)
+
+    return outcomes, interrupted
+
+
+def print_queue_summary(outcomes: list[ChannelOutcome], count: int) -> None:
+    """Сводка по очереди каналов (печатается, если каналов больше одного)."""
+    if len(outcomes) <= 1:
+        return
+
+    done = [o for o in outcomes if o.status == STATUS_DONE]
+    failed = [o for o in outcomes if o.status == STATUS_ERROR]
+    cancelled = [o for o in outcomes if o.status == STATUS_CANCELLED]
+
+    print(f"\n===== Итог по очереди: {len(outcomes)} каналов по {count} постов =====")
+    for index, outcome in enumerate(outcomes, 1):
+        label = outcome.task.label
+        if outcome.status == STATUS_ERROR:
+            print(f"  {index}. «{label}» — ошибка: {outcome.error}")
+        elif outcome.status == STATUS_CANCELLED:
+            print(f"  {index}. «{label}» — {outcome.error or 'прервано'}")
+        else:
+            saved = f", файл: {outcome.path.name}" if outcome.path else ", звёзд не найдено"
+            print(f"  {index}. «{label}» — постов: {outcome.scanned}, "
+                  f"со звёздами: {outcome.with_stars}, записей: {outcome.records}{saved}")
+
+    files = [o for o in done if o.path]
+    print(f"Готово: {len(done)} из {len(outcomes)}, файлов: {len(files)}, "
+          f"записей всего: {sum(o.records for o in outcomes)}")
+    if failed:
+        print(f"Ошибок: {len(failed)} — " + ", ".join(o.task.label for o in failed))
+    if cancelled:
+        print(f"Не обработано: {len(cancelled)} — " + ", ".join(o.task.label for o in cancelled))
+
+
+def queue_exit_code(outcomes: list[ChannelOutcome], interrupted: bool) -> int:
+    """Код завершения: 130 при Ctrl+C, 1 если очередь не дала ни одного канала."""
+    if interrupted:
         return EXIT_INTERRUPTED
+    if outcomes and all(o.status == STATUS_ERROR for o in outcomes):
+        return EXIT_ERROR
     return EXIT_OK
+
+
+# --------------------------------------------------------------------------- #
+# Оркестрация
+# --------------------------------------------------------------------------- #
+async def run(args: argparse.Namespace) -> int:
+    """Основной сценарий: конфиг -> авторизация -> очередь каналов -> Excel."""
+    logger = get_logger("main")
+    base_dir = get_base_dir()
+
+    try:
+        config = load_config(base_dir, args.config)
+    except ConfigError as exc:
+        print(f"Ошибка конфигурации:\n{exc}")
+        return EXIT_CONFIG_ERROR
+
+    print(APP_TITLE)
+    print(f"Конфигурация: {config.config_path}")
+
+    outcomes: list[ChannelOutcome] = []
+    interrupted = False
+    count = 0
+    client: Optional[TelegramClient] = None
+    # Пауза из [DELAY] применяется между реальными запросами к API, а не между
+    # сообщениями: посты без звёзд и уже известные донаторы не ждут вовсе.
+    # Троттлинг один на всю очередь, поэтому накопленный после FloodWait интервал
+    # сохраняется и для следующих каналов.
+    throttle = config.speed.throttle(config.delay.as_tuple())
+
+    try:
+        client = build_client(config, base_dir)
+        try:
+            await authorize(client, config, max_attempts=config.parser.max_attempts)
+        except ConnectionFailureError as exc:
+            print(f"Ошибка подключения: {exc}")
+            return EXIT_CONNECTION_ERROR
+        except AuthError as exc:
+            print(f"Ошибка авторизации: {exc}")
+            return EXIT_AUTH_ERROR
+
+        tasks = await prompt_channels(client, args.channel)
+
+        if args.count is not None:
+            if args.count <= 0:
+                print("Количество постов (--count) должно быть больше 0.")
+                return EXIT_CONFIG_ERROR
+            count = args.count
+        else:
+            count = prompt_count()
+        if len(tasks) > 1:
+            print(f"Каждый канал анализируем по {count} последних постов.")
+
+        outcomes, interrupted = await parse_queue(client, tasks, count, config, args,
+                                                  throttle, base_dir, outcomes)
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        # Ctrl+C до начала/в промежутке между каналами: данные уже сохранены
+        # внутри parse_queue, здесь остаётся корректно завершиться.
+        interrupted = True
+        print("\nРабота прервана пользователем (Ctrl+C).")
+        logger.warning("Работа прервана пользователем.")
+    finally:
+        if client is not None:
+            try:
+                res = client.disconnect()
+                if inspect.isawaitable(res):
+                    await res
+            except Exception:  # pragma: no cover - disconnect не должен ломать выход
+                logger.debug("Ошибка при отключении клиента", exc_info=True)
+
+    print_queue_summary(outcomes, count=count)
+    return queue_exit_code(outcomes, interrupted)
 
 
 # --------------------------------------------------------------------------- #
@@ -276,7 +488,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     except Exception as exc:  # последний рубеж: показываем ошибку вместо traceback
         get_logger("main").exception("Непредвиденная ошибка: %s", exc)
         print(f"Непредвиденная ошибка: {exc}. Подробности — в parser.log")
-        return 1
+        return EXIT_ERROR
 
 
 if __name__ == "__main__":

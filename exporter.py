@@ -146,6 +146,17 @@ def _style_worksheet(worksheet, frame: pd.DataFrame) -> None:
             if cell.value is not None:
                 cell.number_format = "0"
 
+    # Ссылки на посты делаем кликабельными гиперссылками.
+    if "post_link" in frame.columns:
+        link_index = list(frame.columns).index("post_link") + 1
+        link_letter = get_column_letter(link_index)
+        link_font = Font(color="0563C1", underline="single")
+        for cell in worksheet[link_letter][1:]:
+            value = str(cell.value or "")
+            if value.startswith(("https://", "http://")):
+                cell.hyperlink = value
+                cell.font = link_font
+
     _autosize(worksheet, frame)
 
 

@@ -32,7 +32,7 @@ async def main() -> None:
 
     # 2. Загрузка конфигурации ядра Telethon
     try:
-        app_config = load_config()
+        app_config = load_config(get_base_dir())
     except ConfigError as exc:
         sys.stderr.write(f"Ошибка конфигурации ядра: {exc}\n")
         sys.exit(1)

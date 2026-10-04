@@ -344,55 +344,73 @@ pyinstaller stars_parser.spec --noconfirm --clean
 (`anon.session`), `parser.log` и папка `output` появятся в том же каталоге.
 Внутри exe используется `sys.executable`, поэтому пути считаются от расположения exe.
 
-> Статус проверок в репозитории: 141 офлайн-тест пройден
-> (`python -m unittest discover -s tests`), синтаксис `stars_parser.spec` проверен,
+> Статус проверок в репозитории: офлайн-тесты пройдены
+> (`pytest` или `python -m unittest discover -s tests`), синтаксис `stars_parser.spec` проверен,
 > сценарии приложения проверены вплоть до сетевого вызова Telethon.
 > Саму сборку exe в Linux-песочнице выполнить нельзя: в ней отсутствует
 > `libpython3.11.so` (PyInstaller требует разделяемую библиотеку Python, а прав на
 > `apt install libpython3.11` нет). На Windows сборка штатная — `build_exe.bat`.
 
-## 11. Тесты
+## 11. Telegram-бот (aiogram 3.x)
+
+Для удобной автоматизации и работы через Telegram реализован Telegram-бот:
+* пошаговый диалог (wizard): каналы → валидация → диапазон (все / N / годы) → режим (все / > порога);
+* неблокирующая FIFO-очередь с единым семафором на Telethon-клиент;
+* интерактивное обновление прогресса и времени FloodWait;
+* отправка итоговой таблицы и сводного Excel-файла (`Donors` + `Summary`);
+* раздельные логи: `bot.log` и `parser.log`.
+
+### Запуск бота
+
+1. Добавьте в `conf.ini` секцию `[BOT]` (см. образец в `conf.example.ini`):
+```ini
+[BOT]
+TOKEN=ваш_токен_бота       ; или задайте переменную окружения BOT_TOKEN
+ALLOWED_USER_IDS=123456789 ; целые id через запятую
+DONOR_THRESHOLD=80
+SEND_FILES=true
+```
+2. Убедитесь, что сессия Telethon авторизована (запустите предварительно `python main.py`).
+3. Запустите бота:
+```bash
+python -m bot.bot_main
+```
+
+## 12. Тесты
 
 Офлайн-тесты (без Telegram и без сети):
 
 ```bash
-python -m unittest discover -s tests -v
+pytest
 ```
 
-Покрыто: санитайзер имён файлов, валидация конфига (включая `[SPEED]`), разбор ввода канала
-(в т. ч. список каналов через запятую), определение типа сообщения, определение реакторов
-(включая «не найден» и анонимных), обработка `FloodWait`, экспорт в Excel,
-сценарий `main.run` (в т. ч. Ctrl+C и очередь из нескольких каналов: порядок, пропуск
-недоступного канала, прерывание между каналами),
-а также ускорение: троттлинг запросов, пакетное разрешение сущностей
-(один запрос на 200 донаторов, кэш `not_found`, параллельность), обход истории пачками
-и сохранение данных при прерывании.
-
-Отдельно — офлайн-замер скорости (не является тестом, ничего не проверяет):
-
-```bash
-python benchmark.py --count 10000
-```
-
-## 12. Структура проекта
+## 13. Структура проекта
 
 ```
-main.py          # точка входа, ввод данных, оркестрация
+main.py          # точка входа CLI, ввод данных, оркестрация
+bot/             # Telegram-бот (aiogram 3.x)
+  bot_main.py    # точка входа бота, polling, общий loop
+  config_bot.py  # чтение и валидация [BOT]
+  handlers_bot.py# FSM-диалоги и команды бота (/start, /parse, /queue, ...)
+  queue_service.py # очередь задач, семафор=1, отмена, прогресс
+  aggregate.py   # агрегация донатеров, порог, сортировка
+  formatting.py  # текстовый рендер таблицы, пагинация, экранирование
+  access.py      # middleware whitelist проверки
 config.py        # чтение и валидация conf.ini (в т. ч. [SPEED])
 client.py        # создание и авторизация TelegramClient
 handlers.py      # парсинг пачками, пакетное разрешение реакторов, пересылки
 speed.py         # профиль скорости и троттлинг запросов (RequestThrottle)
 models.py        # dataclass StarRecord, ParseStats, колонки
-exporter.py      # Excel (pandas + openpyxl) и safe_filename
+exporter.py      # Excel (pandas + openpyxl), Donors/Summary и safe_filename
 utils.py         # логгер, задержки, работа с текстом и путями
 benchmark.py     # офлайн-сравнение скорости: поштучно против пачек
 conf.example.ini # образец конфигурации (скопировать в conf.ini)
 stars_parser.spec, build_exe.bat, build_exe.sh  # сборка exe через PyInstaller
-tests/           # офлайн-тесты
+tests/           # офлайн-тесты (ядро и бот)
 ```
 
-## 13. Безопасность
+## 14. Безопасность
 
-`conf.ini`, `*.session`, `parser.log` и `output/` добавлены в `.gitignore` —
+`conf.ini`, `*.session`, `parser.log`, `bot.log` и `output/` добавлены в `.gitignore` —
 **не коммитите** свои api_id/api_hash и файлы сессий. Значения конфигурации и сессий
 в логи и в консоль не выводятся (номер телефона маскируется).

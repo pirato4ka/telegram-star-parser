@@ -6,13 +6,13 @@ import re
 import unicodedata
 from datetime import datetime
 from pathlib import Path
-from typing import Iterable, Optional, Sequence
+from typing import TYPE_CHECKING, Iterable, Optional, Sequence
 
 import pandas as pd
 from openpyxl.styles import Alignment, Font
 from openpyxl.utils import get_column_letter
 
-from models import COLUMNS, EXCEL_SHEET_NAME, StarRecord
+from models import COLUMNS, EXCEL_SHEET_NAME, ParseStats, StarRecord
 from utils import (
     ILLEGAL_FILENAME_CHARS,
     WINDOWS_RESERVED_NAMES,
@@ -20,6 +20,19 @@ from utils import (
     collapse_spaces,
     get_logger,
     remove_invisible,
+)
+
+if TYPE_CHECKING:
+    from bot.aggregate import DonorAggregate
+
+DONOR_COLUMNS = (
+    "rank",
+    "reactor_username",
+    "reactor_id",
+    "reactor_type",
+    "stars_total",
+    "posts_count",
+    "channels",
 )
 
 logger = get_logger("exporter")
@@ -215,7 +228,118 @@ def export_records(
     return None
 
 
+def export_donors_summary(
+    donors: list[DonorAggregate],
+    channels_meta: dict,
+    stats_by_channel: dict[str, ParseStats],
+    requested_scope: str,
+    output_path: str,
+) -> str:
+    """Формирует Excel-файл со сводкой донатеров (листы Donors и Summary).
+
+    Возвращает абсолютный путь к сохранённому файлу.
+    """
+    path = Path(output_path).resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    # 1. Лист Donors
+    donor_rows = []
+    for d in donors:
+        channels_str = ", ".join(d.channels) if isinstance(d.channels, (list, set, tuple)) else str(d.channels or "")
+        donor_rows.append({
+            "rank": d.rank,
+            "reactor_username": clean_cell_value(d.reactor_username),
+            "reactor_id": d.reactor_id if d.reactor_id is not None else "",
+            "reactor_type": d.reactor_type,
+            "stars_total": d.stars_total,
+            "posts_count": d.posts_count,
+            "channels": channels_str,
+        })
+
+    df_donors = pd.DataFrame(donor_rows, columns=list(DONOR_COLUMNS))
+
+    # 2. Лист Summary
+    # Список каналов, диапазон парсинга, дата формирования, суммарно scanned/requested,
+    # errors+unparsed, not_found, anonymous, флаг «результат неполный»
+    total_requested = sum(s.requested for s in stats_by_channel.values()) if stats_by_channel else 0
+    total_scanned = sum(s.scanned for s in stats_by_channel.values()) if stats_by_channel else 0
+    total_errors = sum(s.errors for s in stats_by_channel.values()) if stats_by_channel else 0
+    total_unparsed = sum(s.unparsed for s in stats_by_channel.values()) if stats_by_channel else 0
+    total_not_found = sum(s.not_found for s in stats_by_channel.values()) if stats_by_channel else 0
+    total_anon = sum(1 for d in donors if d.reactor_type == "anonymous")
+
+    is_incomplete = (total_errors + total_unparsed) > 0 or any(s.interrupted for s in stats_by_channel.values())
+
+    channel_names_list = list(stats_by_channel.keys())
+    if not channel_names_list and channels_meta:
+        channel_names_list = list(channels_meta.keys())
+
+    summary_data = [
+        {"Параметр": "Список каналов", "Значение": ", ".join(channel_names_list)},
+        {"Параметр": "Диапазон парсинга", "Значение": requested_scope},
+        {"Параметр": "Дата формирования", "Значение": datetime.now().strftime("%Y-%m-%d %H:%M:%S")},
+        {"Параметр": "Обработано сообщений (scanned)", "Значение": total_scanned},
+        {"Параметр": "Запрошено сообщений (requested)", "Значение": total_requested},
+        {"Параметр": "Ошибок и непрочитанных (errors + unparsed)", "Значение": total_errors + total_unparsed},
+        {"Параметр": "Не расшифровано (not_found)", "Значение": total_not_found},
+        {"Параметр": "Анонимных записей (anonymous)", "Значение": total_anon},
+        {"Параметр": "Результат неполный", "Значение": "Да" if is_incomplete else "Нет"},
+    ]
+    df_summary = pd.DataFrame(summary_data)
+
+    with pd.ExcelWriter(path, engine="openpyxl") as writer:
+        df_donors.to_excel(writer, sheet_name="Donors", index=False)
+        _style_donors_worksheet(writer.sheets["Donors"], df_donors)
+
+        df_summary.to_excel(writer, sheet_name="Summary", index=False)
+        _style_summary_worksheet(writer.sheets["Summary"], df_summary)
+
+    logger.info("Excel сводки донатеров сохранён: %s", path)
+    return str(path)
+
+
+def _style_donors_worksheet(worksheet, frame: pd.DataFrame) -> None:
+    """Оформление листа Donors."""
+    header_font = Font(bold=True)
+    for cell in worksheet[1]:
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="left", vertical="center")
+
+    worksheet.freeze_panes = "A2"
+    if len(frame.columns):
+        last_column = get_column_letter(len(frame.columns))
+        worksheet.auto_filter.ref = f"A1:{last_column}1"
+
+    # rank, reactor_id, stars_total, posts_count — целыми числами
+    int_cols = ("rank", "reactor_id", "stars_total", "posts_count")
+    for col_name in int_cols:
+        if col_name not in frame.columns:
+            continue
+        index = list(frame.columns).index(col_name) + 1
+        letter = get_column_letter(index)
+        for cell in worksheet[letter][1:]:
+            if cell.value is not None and str(cell.value).strip() != "":
+                try:
+                    cell.value = int(cell.value)
+                    cell.number_format = "0"
+                except (ValueError, TypeError):
+                    pass
+
+    _autosize(worksheet, frame)
+
+
+def _style_summary_worksheet(worksheet, frame: pd.DataFrame) -> None:
+    """Оформление листа Summary."""
+    header_font = Font(bold=True)
+    for cell in worksheet[1]:
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="left", vertical="center")
+
+    worksheet.freeze_panes = "A2"
+    _autosize(worksheet, frame)
+
+
 __all__ = [
-    "build_dataframe", "build_result_filename", "export_records",
-    "safe_filename", "unique_path", "write_excel",
+    "DONOR_COLUMNS", "build_dataframe", "build_result_filename", "export_donors_summary",
+    "export_records", "safe_filename", "unique_path", "write_excel",
 ]

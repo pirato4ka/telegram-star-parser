@@ -4,8 +4,10 @@ import asyncio
 import os
 import sys
 import tempfile
+import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -275,3 +277,210 @@ def test_year_range_filtering():
         assert [m.id for m in collected] == [2, 4]  # m2023 и m2021
 
     asyncio.run(_run())
+
+
+# --------------------------------------------------------------------------- #
+# Хендлеры бота: resolve_channel в мастере /parse и /warmup (регрессии)
+# --------------------------------------------------------------------------- #
+class _FakeChannelClient:
+    """Мини-клиент Telethon: канал 42 доступен по сыром и -100 id (как в сессии)."""
+
+    MARKED_ID = -100000000042
+
+    def __init__(self):
+        self.calls = []
+
+    async def get_entity(self, value):
+        self.calls.append(value)
+        if value in (42, self.MARKED_ID):
+            from telethon.tl import types
+            return types.Channel(
+                id=42, title="News Chan", photo=types.ChatPhotoEmpty(),
+                date=datetime.now(timezone.utc), access_hash=1, broadcast=True,
+            )
+        raise ValueError(f"нет канала {value!r}")
+
+    async def get_messages(self, entity, limit=0):
+        return [SimpleNamespace(id=555)]
+
+
+class _FakeState:
+    def __init__(self):
+        self.data = {}
+        self.state = None
+
+    async def update_data(self, **kwargs):
+        self.data.update(kwargs)
+
+    async def set_state(self, state):
+        self.state = state
+
+    async def get_data(self):
+        return dict(self.data)
+
+    async def get_state(self):
+        return self.state
+
+    async def clear(self):
+        self.state = None
+        self.data = {}
+
+
+class _FakeMessage:
+    """Мини-замена aiogram Message: answer/edit_text пишут в списки."""
+
+    def __init__(self, text="", is_bot=False):
+        self.text = text
+        self.from_user = SimpleNamespace(is_bot=is_bot, id=1, username="u")
+        self.answers = []
+        self.edits = []
+
+    async def answer(self, text, parse_mode=None, reply_markup=None):
+        child = _FakeMessage(text=text, is_bot=True)
+        self.answers.append((text, parse_mode, child))
+        return child
+
+    async def edit_text(self, text, parse_mode=None, reply_markup=None):
+        self.edits.append((text, parse_mode))
+        return self
+
+
+class _FakeStatusMsg(_FakeMessage):
+    pass
+
+
+class _FakeBotClient:
+    """Bot-часть: send_message возвращает сообщение с edit_text."""
+
+    def __init__(self):
+        self.sent = []
+
+    async def send_message(self, chat_id, text, parse_mode=None):
+        msg = _FakeStatusMsg(text=text, is_bot=True)
+        self.sent.append((text, parse_mode, msg))
+        return msg
+
+
+def _bot_config():
+    return BotConfig(token="1:test")
+
+
+class TestWarmupTask(unittest.TestCase):
+    """/warmup: bare-id строка из команды, HTML-форматирование ответов."""
+
+    def test_warmup_success_html_formatting(self):
+        import bot.handlers_bot as hb
+
+        async def fake_warmup(client, entity, limit=10000, throttle=None, show_progress=True):
+            return 250
+
+        orig = hb.warmup_participants
+        hb.warmup_participants = fake_warmup
+        try:
+            bot = _FakeBotClient()
+            task = SimpleNamespace(current_channel="")
+            asyncio.run(hb._run_warmup_task(
+                task, bot, 777, _FakeChannelClient(), "42",
+            ))
+        finally:
+            hb.warmup_participants = orig
+
+        # Первое сообщение — с parse_mode=HTML (экранированный текст)
+        assert bot.sent[0][1] == "HTML"
+        # Итоговое сообщение — с тегом <b> и parse_mode=HTML
+        final_text, final_mode = bot.sent[0][2].edits[-1]
+        assert final_mode == "HTML"
+        assert "<b>News Chan</b>" in final_text
+        assert "250 участников" in final_text
+        # /status показывает текущий канал задачи
+        assert task.current_channel == "42"
+
+    def test_warmup_error_message_is_html(self):
+        import bot.handlers_bot as hb
+
+        class BadClient:
+            async def get_entity(self, value):
+                raise ValueError("нет <канала> & связи")
+
+        bot = _FakeBotClient()
+        task = SimpleNamespace(current_channel="")
+        asyncio.run(hb._run_warmup_task(task, bot, 777, BadClient(), "@bad"))
+
+        final_text, final_mode = bot.sent[0][2].edits[-1]
+        assert final_mode == "HTML"
+        assert "&lt;канала&gt;" in final_text  # экранировано и рендерится как <канала>
+        assert "<канала>" not in final_text
+
+
+class TestChannelsInputValidation(unittest.TestCase):
+    """/parse: проверка каналов — bare id без -100 и строковый raw."""
+
+    def test_bare_id_resolves_and_shows_title(self):
+        import bot.handlers_bot as hb
+
+        state, msg = _FakeState(), _FakeMessage(text="42")
+        asyncio.run(hb._handle_channels_input(
+            msg, state, "42", _FakeChannelClient(), _bot_config(),
+        ))
+
+        meta = state.data["channels_meta"]
+        assert len(meta) == 1
+        assert meta[0]["found"] is True
+        assert meta[0]["title"] == "News Chan"
+        assert meta[0]["last_id"] == 555
+        # Все каналы найдены -> шаг SCOPE
+        assert state.state is not None
+
+    def test_unresolved_channel_goes_to_validate(self):
+        import bot.handlers_bot as hb
+
+        state, msg = _FakeState(), _FakeMessage(text="@nope, 42")
+        asyncio.run(hb._handle_channels_input(
+            msg, state, "@nope, 42", _FakeChannelClient(), _bot_config(),
+        ))
+
+        meta = state.data["channels_meta"]
+        assert [c["found"] for c in meta] == [False, True]
+        assert state.state is not None
+
+
+class TestParsingTaskStringRaw(unittest.TestCase):
+    """/parse: _run_parsing_task разрешает строковый raw ("42"/"-100...") из метаданных."""
+
+    def test_string_raw_resolves_and_parses(self):
+        import bot.handlers_bot as hb
+
+        captured = {}
+
+        async def fake_parse_channel(**kwargs):
+            kwargs["stats"].scanned = 10
+            kwargs["stats"].with_stars = 1
+            return kwargs["stats"]
+
+        async def fake_send_final(**kwargs):
+            captured.update(kwargs)
+
+        orig_parse, orig_send = hb.parse_channel, hb._send_final_results
+        hb.parse_channel, hb._send_final_results = fake_parse_channel, fake_send_final
+        try:
+            task = SimpleNamespace(
+                cancelled_by_user=False, current_channel="", scanned=0,
+                with_stars=0, total_hint=None, flood_wait_until=None,
+            )
+            wizard = {
+                "channels_meta": [
+                    {"raw": "42", "title": "News Chan", "found": True, "last_id": 555},
+                ],
+                "limit": 100,
+                "scope_desc": "Последние 100",
+                "only_above_threshold": False,
+            }
+            asyncio.run(hb._run_parsing_task(
+                task, _FakeBotClient(), 1, 10,
+                _FakeChannelClient(), _bot_config(), wizard, _FakeState(),
+            ))
+        finally:
+            hb.parse_channel, hb._send_final_results = orig_parse, orig_send
+
+        assert captured.get("channel_outcomes") == {"News Chan": "успешно"}
+        assert captured["stats_by_channel"]["News Chan"].scanned == 10

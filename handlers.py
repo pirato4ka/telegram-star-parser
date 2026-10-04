@@ -6,7 +6,8 @@ import asyncio
 import re
 import time
 from contextlib import aclosing
-from typing import Any, AsyncIterator, Iterable, Optional, Sequence, Union
+from datetime import datetime, timedelta, timezone
+from typing import Any, AsyncIterator, Awaitable, Callable, Iterable, Optional, Sequence, Union
 
 from telethon import TelegramClient, functions, utils
 from telethon.errors import FloodWaitError, RPCError
@@ -914,6 +915,11 @@ async def iter_message_batches(
     *,
     wait_time: Optional[float] = 0.0,
     throttle: Optional[RequestThrottle] = None,
+    start_date: Optional[datetime] = None,
+    end_date: Optional[datetime] = None,
+    stats: Optional[ParseStats] = None,
+    flood_callback: Optional[Callable[[datetime | None], Awaitable[None]]] = None,
+    selected_years: Optional[set[int]] = None,
 ) -> AsyncIterator[list[Any]]:
     """Отдаёт до `limit` последних сообщений **пачками** по `batch_size`.
 
@@ -937,16 +943,62 @@ async def iter_message_batches(
     buffer: list[Any] = []
     since_request = 0
 
+    # Нормализуем границы дат к UTC
+    s_date = start_date
+    if s_date is not None:
+        if s_date.tzinfo is None:
+            s_date = s_date.replace(tzinfo=timezone.utc)
+        else:
+            s_date = s_date.astimezone(timezone.utc)
+
+    e_date = end_date
+    if e_date is not None:
+        if e_date.tzinfo is None:
+            e_date = e_date.replace(tzinfo=timezone.utc)
+        else:
+            e_date = e_date.astimezone(timezone.utc)
+
+    offset_date = (e_date + timedelta(seconds=1)) if e_date is not None else None
+
     while remaining > 0:
         if throttle is not None:
             # Первый запрос истории этой итерации (дальше — по 100 сообщений).
             await throttle.wait()
             since_request = 0
         try:
-            async for message in client.iter_messages(
-                entity, limit=remaining, offset_id=offset_id, wait_time=wait_time
-            ):
+            iter_kwargs: dict[str, Any] = {
+                "limit": remaining,
+                "offset_id": offset_id,
+                "wait_time": wait_time,
+            }
+            if offset_date is not None and offset_id == 0:
+                iter_kwargs["offset_date"] = offset_date
+
+            async for message in client.iter_messages(entity, **iter_kwargs):
                 offset_id = int(getattr(message, "id", 0) or 0)
+                m_date = getattr(message, "date", None)
+                if m_date is not None:
+                    if m_date.tzinfo is None:
+                        m_date = m_date.replace(tzinfo=timezone.utc)
+                    else:
+                        m_date = m_date.astimezone(timezone.utc)
+
+                # Если сообщение новее end_date (например, если offset_date не отсек его)
+                if e_date is not None and m_date is not None and m_date > e_date:
+                    continue
+
+                # Если дата сообщения раньше нижней границы периода
+                if s_date is not None and m_date is not None and m_date < s_date:
+                    if buffer:
+                        yield buffer
+                        buffer = []
+                    return
+
+                # Если заданы конкретные выбранные годы, пропускаем сообщения вне объединения лет,
+                # не останавливая сканирование (т.к. более старые годы могут быть выбраны)
+                if selected_years is not None and m_date is not None and m_date.year not in selected_years:
+                    continue
+
                 remaining -= 1
                 buffer.append(message)
                 since_request += 1
@@ -973,7 +1025,20 @@ async def iter_message_batches(
                 f"FloodWait: Telegram просит подождать {format_seconds(wait_seconds)}. "
                 "Продолжаем автоматически..."
             )
-            await asyncio.sleep(wait_seconds)
+            flood_until = datetime.now(timezone.utc) + timedelta(seconds=wait_seconds)
+            if flood_callback is not None:
+                try:
+                    await flood_callback(flood_until)
+                except Exception:
+                    pass
+            try:
+                await asyncio.sleep(wait_seconds)
+            finally:
+                if flood_callback is not None:
+                    try:
+                        await flood_callback(None)
+                    except Exception:
+                        pass
         except (KeyboardInterrupt, asyncio.CancelledError):
             # Ctrl+C: отдаём то, что уже получили, и пробрасываем прерывание.
             if buffer:
@@ -984,6 +1049,8 @@ async def iter_message_batches(
             if buffer:
                 yield buffer
                 buffer = []
+            if stats is not None and remaining > 0:
+                stats.unparsed += remaining
             logger.error("Ошибка при получении сообщений: %s", exc)
             tqdm.write(f"Ошибка при получении сообщений: {exc}")
             return
@@ -1171,6 +1238,10 @@ async def parse_channel(
     speed: Optional[SpeedProfile] = None,
     throttle: Optional[RequestThrottle] = None,
     batch_size: Optional[int] = None,
+    start_date: Optional[datetime] = None,
+    end_date: Optional[datetime] = None,
+    progress_callback: Optional[Callable[[str, int, int, Optional[int], Optional[datetime]], Awaitable[None]]] = None,
+    selected_years: Optional[set[int]] = None,
 ) -> ParseStats:
     """Проходит по `limit` последним сообщениям канала и собирает записи о звёздах.
 
@@ -1206,11 +1277,29 @@ async def parse_channel(
     requests_before = throttle.requests
     slept_before = throttle.slept
 
+    current_flood_until: Optional[datetime] = None
+
+    async def _on_flood(until: Optional[datetime]) -> None:
+        nonlocal current_flood_until
+        current_flood_until = until
+        if progress_callback is not None:
+            try:
+                await progress_callback(
+                    channel_name, stats.scanned, stats.with_stars,
+                    stats.requested, current_flood_until
+                )
+            except Exception:
+                pass
+
+    last_reported_scanned = 0
+
     with tqdm(total=max(limit, 0), desc=PROGRESS_DESCRIPTION, unit="сообщ.",
               dynamic_ncols=True, leave=True) as progress:
         source = iter_message_batches(
             client, entity, limit, chunk,
             wait_time=speed.history_wait_time, throttle=throttle,
+            start_date=start_date, end_date=end_date, stats=stats,
+            flood_callback=_on_flood, selected_years=selected_years,
         )
         async with aclosing(source):
             async for messages in source:
@@ -1218,6 +1307,24 @@ async def parse_channel(
                     client, messages, channel_name, cache, records, stats,
                     channel_entity=entity, throttle=throttle, progress=progress,
                 )
+                if progress_callback is not None and (stats.scanned - last_reported_scanned >= 20 or stats.scanned >= limit):
+                    last_reported_scanned = stats.scanned
+                    try:
+                        await progress_callback(
+                            channel_name, stats.scanned, stats.with_stars,
+                            stats.requested, current_flood_until
+                        )
+                    except Exception:
+                        pass
+
+    if progress_callback is not None and stats.scanned != last_reported_scanned:
+        try:
+            await progress_callback(
+                channel_name, stats.scanned, stats.with_stars,
+                stats.requested, current_flood_until
+            )
+        except Exception:
+            pass
 
     stats.elapsed = time.monotonic() - started
     stats.api_requests = max(0, throttle.requests - requests_before)

@@ -1,4 +1,4 @@
-"""Хендлеры aiogram 3.x: команды и FSM wizard для парсинга."""
+"""Хендлеры aiogram 3.x: команды, админ-панель доступа и FSM wizard для парсинга."""
 
 from __future__ import annotations
 
@@ -38,6 +38,7 @@ from bot.queue_service import (
     TASK_TYPE_PARSE,
     TASK_TYPE_WARMUP,
 )
+from bot.user_store import UserStore
 from exporter import (
     build_result_filename,
     export_donors_summary,
@@ -61,6 +62,11 @@ logger = get_logger("bot")
 
 router = Router()
 
+# Технический предел обхода в режиме «все посты» (в отчёты не попадает).
+UNLIMITED_LIMIT = 1_000_000
+
+BOT_TITLE = "👋 <b>Бот для пробива донатеров звёзд в Telegram</b>"
+
 
 class WizardState(StatesGroup):
     CHANNELS = State()
@@ -70,6 +76,11 @@ class WizardState(StatesGroup):
     SCOPE_YEARS = State()
     MODE = State()
     RUN = State()
+
+
+class AdminState(StatesGroup):
+    ADD_USER = State()
+    DEL_USER = State()
 
 
 # Управление таймаутами бездействия
@@ -106,22 +117,150 @@ def _cancel_user_idle_timer(user_id: int) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Вспомогательные функции: права администратора и клавиатуры
+# --------------------------------------------------------------------------- #
+def is_admin(user_id: int, bot_config: BotConfig) -> bool:
+    """Является ли пользователь администратором (может выдавать доступ)."""
+    return int(user_id) in set(bot_config.admin_ids or set())
+
+
+def _main_keyboard(admin: bool) -> InlineKeyboardMarkup:
+    """Клавиатура главного меню."""
+    rows = [
+        [InlineKeyboardButton(text="🚀 Запустить парсинг", callback_data="wiz:start")],
+        [
+            InlineKeyboardButton(text="📈 Моя задача", callback_data="wiz:status"),
+            InlineKeyboardButton(text="🕒 Очередь", callback_data="wiz:queue"),
+        ],
+        [InlineKeyboardButton(text="❓ Помощь", callback_data="wiz:help")],
+    ]
+    if admin:
+        rows.append([InlineKeyboardButton(text="🛠 Доступ к боту", callback_data="adm:panel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _cancel_keyboard(callback_data: str = "wiz:cancel") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⏹ Отмена", callback_data=callback_data)]
+    ])
+
+
+def _help_text(admin: bool = False) -> str:
+    """Справка бота. Строка «/help — эта справка» намеренно не дублируется."""
+    lines = [
+        "❓ <b>Справка</b>",
+        "",
+        "Бот проходит по последним постам канала и собирает, кто и сколько звёзд "
+        "(Paid Reactions) отправил. В Excel каждый донат — отдельной строкой со "
+        "ссылкой на пост.",
+        "",
+        "<b>Как это работает</b>",
+        "1️⃣ присылаете каналы — @username, ссылку или id",
+        "2️⃣ выбираете диапазон постов: все, последние N или по годам",
+        "3️⃣ выбираете, кого показывать: всех донатеров или только крупных",
+        "4️⃣ получаете таблицу и Excel-файл",
+        "",
+        "<b>Команды</b>",
+        "• /parse [каналы] — запустить парсинг",
+        "• /status — прогресс вашей задачи",
+        "• /queue — очередь задач",
+        "• /cancel — отменить диалог или задачу",
+        "• /warmup &lt;канал&gt; — прогреть кэш участников группы обсуждения",
+    ]
+    if admin:
+        lines += [
+            "",
+            "<b>Администратору</b>",
+            "• /admin — панель доступа к боту",
+            "• /users — кто имеет доступ",
+            "• /adduser &lt;id&gt; [@username] — добавить пользователя",
+            "• /deluser &lt;id&gt; — убрать пользователя",
+        ]
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------- #
 # Команды /start, /help, /cancel, /queue, /status, /warmup
 # --------------------------------------------------------------------------- #
 @router.message(Command("start"))
-@router.message(Command("help"))
-async def cmd_start_help(message: Message, state: FSMContext, bot_config: BotConfig) -> None:
+async def cmd_start(message: Message, state: FSMContext, bot_config: BotConfig) -> None:
+    admin = is_admin(message.from_user.id, bot_config)
+    if await state.get_state():
+        await state.clear()
     text = (
-        "👋 <b>Бот для сбора звёзд (Paid Reactions)</b>\n\n"
-        "<b>Доступные команды:</b>\n"
-        "• /parse [каналы] — запустить мастер парсинга каналов\n"
-        "• /status — прогресс вашей текущей задачи\n"
-        "• /queue — общая очередь задач\n"
-        "• /cancel — отменить активный опрос или задачу парсинга\n"
-        "• /warmup &lt;канал&gt; — прогреть кэш участников группы обсуждения\n"
-        "• /help — эта справка\n"
+        f"{BOT_TITLE}\n\n"
+        "Собираю, кто и сколько звёзд отправил на посты канала, и отдаю готовый "
+        "Excel: <b>каждый донат отдельной строкой</b> — канал, ссылка на пост, "
+        "username, id и количество звёзд.\n\n"
+        "Нажмите «🚀 Запустить парсинг» или пришлите /parse."
     )
-    await message.answer(text, parse_mode="HTML")
+    await message.answer(text, parse_mode="HTML", reply_markup=_main_keyboard(admin))
+
+
+@router.message(Command("help"))
+async def cmd_help(message: Message, bot_config: BotConfig) -> None:
+    await message.answer(
+        _help_text(is_admin(message.from_user.id, bot_config)),
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data == "wiz:help")
+async def cb_help(callback: CallbackQuery, bot_config: BotConfig) -> None:
+    await callback.answer()
+    try:
+        await callback.message.edit_text(
+            _help_text(is_admin(callback.from_user.id, bot_config)),
+            parse_mode="HTML",
+            reply_markup=_main_keyboard(is_admin(callback.from_user.id, bot_config)),
+        )
+    except TelegramBadRequest:
+        await callback.message.answer(_help_text(is_admin(callback.from_user.id, bot_config)),
+                                      parse_mode="HTML")
+
+
+@router.callback_query(F.data == "wiz:start")
+async def cb_wizard_start(
+    callback: CallbackQuery,
+    state: FSMContext,
+    queue_service: QueueService,
+    bot_config: BotConfig,
+) -> None:
+    """Кнопка «🚀 Запустить парсинг» в главном меню."""
+    user_id = callback.from_user.id
+    active_task = queue_service.get_user_active_task(user_id)
+    if active_task:
+        await callback.answer()
+        await callback.message.answer(
+            "⚠️ У вас уже есть активная задача. Дождитесь завершения "
+            "или отмените её командой /cancel."
+        )
+        return
+
+    await state.clear()
+    await state.set_state(WizardState.CHANNELS)
+    _reset_user_idle_timer(user_id, state, callback.bot, bot_config.wizard_idle_timeout)
+    await callback.answer()
+    await callback.message.answer(
+        _channels_step_text(),
+        parse_mode="HTML",
+        reply_markup=_cancel_keyboard(),
+    )
+
+
+@router.callback_query(F.data == "wiz:cancel")
+async def cb_wizard_cancel(
+    callback: CallbackQuery, state: FSMContext, bot_config: BotConfig
+) -> None:
+    _cancel_user_idle_timer(callback.from_user.id)
+    await state.clear()
+    await callback.answer("Отменено")
+    text = "❌ Действие отменено. Начать заново — /parse."
+    keyboard = _main_keyboard(is_admin(callback.from_user.id, bot_config))
+    try:
+        await callback.message.edit_text(text, reply_markup=keyboard)
+    except TelegramBadRequest:
+        await callback.message.answer(text, reply_markup=keyboard)
 
 
 @router.message(Command("cancel"))
@@ -143,20 +282,41 @@ async def cmd_cancel(message: Message, state: FSMContext, queue_service: QueueSe
         await message.answer("Нет активных диалогов или задач для отмены.")
 
 
+def _progress_bar(done: int, total: int, width: int = 14) -> str:
+    """Полоска прогресса для сообщений со статусом: ▰▰▰▱▱▱▱ 42%."""
+    if total <= 0:
+        return ""
+    ratio = max(0.0, min(1.0, done / total))
+    filled = int(round(ratio * width))
+    bar = "▰" * filled + "▱" * (width - filled)
+    return f"{bar} {int(round(ratio * 100))}%"
+
+
 @router.message(Command("status"))
 async def cmd_status(message: Message, queue_service: QueueService) -> None:
-    user_id = message.from_user.id
+    await _answer_status(message, message.from_user.id, queue_service)
+
+
+@router.callback_query(F.data == "wiz:status")
+async def cb_status(callback: CallbackQuery, queue_service: QueueService) -> None:
+    await callback.answer()
+    await _answer_status(callback.message, callback.from_user.id, queue_service)
+
+
+async def _answer_status(message: Message, user_id: int, queue_service: QueueService) -> None:
     task = queue_service.get_user_active_task(user_id)
     if not task:
-        await message.answer("У вас нет активных задач.")
+        await message.answer("У вас нет активных задач. Запустить парсинг — /parse.")
         return
 
     if task.status == STATUS_PENDING:
         pos = queue_service.get_task_position(task)
         await message.answer(
-            f"⏳ Ваша задача в очереди. Позиция: <b>{pos}</b>\n"
+            f"⏳ <b>Задача в очереди</b>\n"
+            f"Позиция: <b>{pos}</b>\n"
             f"Каналы: {html.escape(', '.join(task.channels))}\n"
-            f"Для отмены используйте /cancel",
+            f"Диапазон: {html.escape(task.scope_desc)}\n"
+            f"<i>Отмена — /cancel</i>",
             parse_mode="HTML",
         )
     elif task.status == STATUS_RUNNING:
@@ -165,31 +325,405 @@ async def cmd_status(message: Message, queue_service: QueueService) -> None:
             wait_sec = max(0, int((task.flood_wait_until - datetime.now(timezone.utc)).total_seconds()))
             flood_text = f"\n⚠️ Ожидание FloodWait: {wait_sec} сек."
 
-        tot = f"/{task.total_hint}" if task.total_hint else ""
+        tail = f"/{task.total_hint}" if task.total_hint else ""
+        bar = _progress_bar(task.scanned, task.total_hint or 0)
+        bar_line = f"\n{bar}" if bar else ""
         await message.answer(
-            f"🔄 <b>Задача выполняется</b>\n"
+            f"🔄 <b>Задача выполняется</b>{bar_line}\n"
             f"Канал: <b>{html.escape(task.current_channel)}</b>\n"
-            f"Обработано: {task.scanned}{tot} (со звёздами: {task.with_stars}){flood_text}\n"
-            f"Для отмены используйте /cancel",
+            f"Обработано: {task.scanned}{tail} (со звёздами: {task.with_stars}){flood_text}\n"
+            f"<i>Отмена — /cancel</i>",
             parse_mode="HTML",
         )
 
 
 @router.message(Command("queue"))
 async def cmd_queue(message: Message, queue_service: QueueService) -> None:
+    await _answer_queue(message, queue_service)
+
+
+@router.callback_query(F.data == "wiz:queue")
+async def cb_queue(callback: CallbackQuery, queue_service: QueueService) -> None:
+    await callback.answer()
+    await _answer_queue(callback.message, queue_service)
+
+
+async def _answer_queue(message: Message, queue_service: QueueService) -> None:
     tasks = queue_service.get_all_active_tasks()
     if not tasks:
-        await message.answer("Очередь задач пуста.")
+        await message.answer("🕒 Очередь задач пуста.")
         return
 
-    lines = ["<b>Текущая очередь задач:</b>"]
+    lines = ["<b>🕒 Очередь задач</b>", ""]
     for idx, t in enumerate(tasks, start=1):
         status_sym = "🔄 выполняется" if t.status == STATUS_RUNNING else "⏳ ожидает"
         lines.append(
             f"{idx}. {html.escape(t.user_display)} — {status_sym}\n"
-            f"   Тип: {t.task_type}, Каналы: {html.escape(', '.join(t.channels))}"
+            f"   {html.escape(', '.join(t.channels))} · {html.escape(t.scope_desc)}"
         )
     await message.answer("\n".join(lines), parse_mode="HTML")
+
+
+# --------------------------------------------------------------------------- #
+# Админ-панель: добавление и удаление пользователей по id
+# --------------------------------------------------------------------------- #
+def _access_panel_text(store: Optional[UserStore], bot_config: BotConfig) -> str:
+    added = store.all() if store else []
+    lines = [
+        "🛠 <b>Доступ к боту</b>",
+        "",
+        f"Администраторы: <b>{len(bot_config.admin_ids)}</b>",
+        f"Из conf.ini (ALLOWED_USER_IDS): <b>{len(bot_config.allowed_user_ids)}</b>",
+        f"Добавлено через бота: <b>{len(added)}</b>",
+    ]
+    if added:
+        lines.append("")
+        lines.append("<b>Добавленные пользователи:</b>")
+        for user in added[:20]:
+            lines.append(f"• <code>{user.user_id}</code> — {html.escape(user.title())}")
+        if len(added) > 20:
+            lines.append(f"… и ещё {len(added) - 20}")
+    return "\n".join(lines)
+
+
+def _access_panel_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="👥 Список доступа", callback_data="adm:list"),
+            InlineKeyboardButton(text="🔄 Обновить", callback_data="adm:panel"),
+        ],
+        [InlineKeyboardButton(text="➕ Добавить по id", callback_data="adm:add")],
+        [InlineKeyboardButton(text="➖ Удалить по id", callback_data="adm:del")],
+    ])
+
+
+async def _require_admin_message(message: Message, bot_config: BotConfig) -> bool:
+    if is_admin(message.from_user.id, bot_config):
+        return True
+    await message.answer("⛔ Команда доступна только администратору.")
+    return False
+
+
+async def _require_admin_callback(callback: CallbackQuery, bot_config: BotConfig) -> bool:
+    if is_admin(callback.from_user.id, bot_config):
+        return True
+    await callback.answer("⛔ Только для администратора", show_alert=True)
+    return False
+
+
+@router.message(Command("admin"))
+async def cmd_admin(
+    message: Message,
+    state: FSMContext,
+    bot_config: BotConfig,
+    user_store: Optional[UserStore] = None,
+) -> None:
+    if not await _require_admin_message(message, bot_config):
+        return
+    await state.clear()
+    await message.answer(
+        _access_panel_text(user_store, bot_config),
+        parse_mode="HTML",
+        reply_markup=_access_panel_keyboard(),
+    )
+
+
+@router.callback_query(F.data == "adm:panel")
+async def cb_admin_panel(
+    callback: CallbackQuery,
+    state: FSMContext,
+    bot_config: BotConfig,
+    user_store: Optional[UserStore] = None,
+) -> None:
+    if not await _require_admin_callback(callback, bot_config):
+        return
+    await state.clear()
+    await callback.answer()
+    text = _access_panel_text(user_store, bot_config)
+    try:
+        await callback.message.edit_text(text, parse_mode="HTML",
+                                         reply_markup=_access_panel_keyboard())
+    except TelegramBadRequest:
+        await callback.message.answer(text, parse_mode="HTML",
+                                      reply_markup=_access_panel_keyboard())
+
+
+def _users_text(bot_config: BotConfig, store: Optional[UserStore]) -> str:
+    """Полный список тех, у кого есть доступ к боту."""
+    added = store.all() if store else []
+    lines = ["👥 <b>Кто имеет доступ к боту</b>", "", "<b>Администраторы:</b>"]
+    lines.extend(f"• <code>{uid}</code>" for uid in sorted(bot_config.admin_ids) or ["• —"])
+    lines.append("")
+    lines.append("<b>Из conf.ini (ALLOWED_USER_IDS):</b>")
+    lines.extend(f"• <code>{uid}</code>" for uid in sorted(bot_config.allowed_user_ids) or ["• —"])
+    lines.append("")
+    lines.append("<b>Добавлены через бота:</b>")
+    if added:
+        for user in added:
+            lines.append(f"• <code>{user.user_id}</code> — {html.escape(user.title())}")
+    else:
+        lines.append("• —")
+    return "\n".join(lines)
+
+
+@router.message(Command("users"))
+async def cmd_users(
+    message: Message,
+    bot_config: BotConfig,
+    user_store: Optional[UserStore] = None,
+) -> None:
+    if not await _require_admin_message(message, bot_config):
+        return
+    await message.answer(_users_text(bot_config, user_store), parse_mode="HTML")
+
+
+@router.callback_query(F.data == "adm:list")
+async def cb_users_list(callback: CallbackQuery, bot_config: BotConfig,
+                        user_store: Optional[UserStore] = None) -> None:
+    if not await _require_admin_callback(callback, bot_config):
+        return
+    await callback.answer()
+    await callback.message.answer(_users_text(bot_config, user_store), parse_mode="HTML")
+
+
+def _parse_user_ids(raw: str) -> tuple[list[int], str]:
+    """Разбирает «123456789 @vasya» в (список id, username/комментарий)."""
+    raw = (raw or "").replace(",", " ").replace(";", " ").split()
+    ids: list[int] = []
+    note_parts: list[str] = []
+    for token in raw:
+        cleaned = token.strip().lstrip("@")
+        if cleaned.lstrip("-").isdigit():
+            ids.append(int(cleaned))
+        else:
+            note_parts.append(token.lstrip("@"))
+    return ids, " ".join(note_parts)
+
+
+async def _add_user(
+    bot: Bot, user_id: int, *, note: str, added_by: int, store: Optional[UserStore]
+) -> str:
+    """Добавляет пользователя и пытается сообщить ему о доступе."""
+    if store is None:
+        return "❌ Хранилище пользователей недоступно."
+    created, user = store.add(user_id, username=note, added_by=added_by)
+    if created:
+        try:
+            await bot.send_message(
+                user_id,
+                f"{BOT_TITLE}\n\n✅ Вам открыт доступ к боту. Запустите парсинг командой /parse.",
+                parse_mode="HTML",
+                reply_markup=_main_keyboard(False),
+            )
+        except Exception as exc:
+            logger.info("Не удалось уведомить пользователя %s о доступе: %s", user_id, exc)
+    title = html.escape(user.title())
+    if created:
+        return f"✅ Пользователь <code>{user_id}</code> ({title}) добавлен."
+    return f"ℹ️ Пользователь <code>{user_id}</code> уже был в списке — данные обновлены."
+
+
+async def _add_users_from_text(message: Message, raw: str, bot_config: BotConfig,
+                               store: Optional[UserStore], state: FSMContext) -> None:
+    ids, note = _parse_user_ids(raw)
+    if not ids:
+        await message.answer(
+            "Не вижу id. Пришлите числовой id пользователя, например:\n"
+            "<code>123456789</code> или <code>123456789, 987654321</code>",
+            parse_mode="HTML",
+        )
+        return
+    if len(ids) > 50:
+        await message.answer("Слишком много id за раз (максимум 50).")
+        return
+
+    results = []
+    for user_id in ids:
+        if user_id in (bot_config.admin_ids | bot_config.allowed_user_ids):
+            results.append(f"ℹ️ <code>{user_id}</code> уже в whitelist из conf.ini.")
+            continue
+        results.append(await _add_user(message.bot, user_id, note=note,
+                                       added_by=message.from_user.id, store=store))
+    await state.clear()
+    await message.answer(
+        "\n".join(results) + "\n\n" + _access_panel_text(store, bot_config),
+        parse_mode="HTML",
+        reply_markup=_access_panel_keyboard(),
+    )
+
+
+@router.message(Command("adduser"))
+async def cmd_adduser(
+    message: Message,
+    state: FSMContext,
+    bot_config: BotConfig,
+    user_store: Optional[UserStore] = None,
+) -> None:
+    if not await _require_admin_message(message, bot_config):
+        return
+    raw = message.text.partition(" ")[2].strip()
+    if not raw:
+        await state.set_state(AdminState.ADD_USER)
+        await message.answer(
+            "➕ <b>Добавление пользователя</b>\n\n"
+            "Пришлите id пользователя (можно несколько через запятую).\n"
+            "Необязательно: рядом можно указать @username для пометки.\n\n"
+            "<i>Пример: 123456789 @vasya</i>",
+            parse_mode="HTML",
+            reply_markup=_cancel_keyboard("adm:panel"),
+        )
+        return
+    await _add_users_from_text(message, raw, bot_config, user_store, state)
+
+
+@router.callback_query(F.data == "adm:add")
+async def cb_admin_add(
+    callback: CallbackQuery,
+    state: FSMContext,
+    bot_config: BotConfig,
+) -> None:
+    if not await _require_admin_callback(callback, bot_config):
+        return
+    await state.set_state(AdminState.ADD_USER)
+    await callback.answer()
+    await callback.message.answer(
+        "➕ <b>Добавление пользователя</b>\n\n"
+        "Пришлите id пользователя (можно несколько через запятую).\n"
+        "Необязательно: рядом можно указать @username для пометки.\n\n"
+        "<i>Пример: 123456789 @vasya</i>",
+        parse_mode="HTML",
+        reply_markup=_cancel_keyboard("adm:panel"),
+    )
+
+
+@router.message(AdminState.ADD_USER)
+async def process_admin_add(
+    message: Message,
+    state: FSMContext,
+    bot_config: BotConfig,
+    user_store: Optional[UserStore] = None,
+) -> None:
+    if not await _require_admin_message(message, bot_config):
+        return
+    await _add_users_from_text(message, message.text or "", bot_config, user_store, state)
+
+
+@router.message(Command("deluser"))
+async def cmd_deluser(
+    message: Message,
+    state: FSMContext,
+    bot_config: BotConfig,
+    user_store: Optional[UserStore] = None,
+) -> None:
+    if not await _require_admin_message(message, bot_config):
+        return
+    raw = message.text.partition(" ")[2].strip()
+    if not raw:
+        await state.set_state(AdminState.DEL_USER)
+        await message.answer(
+            "➖ <b>Удаление пользователя</b>\n\nПришлите id, которому нужно закрыть доступ:",
+            parse_mode="HTML",
+            reply_markup=_cancel_keyboard("adm:panel"),
+        )
+        return
+    await _remove_users_from_text(message, raw, bot_config, user_store, state)
+
+
+@router.callback_query(F.data == "adm:del")
+async def cb_admin_del(callback: CallbackQuery, state: FSMContext, bot_config: BotConfig) -> None:
+    if not await _require_admin_callback(callback, bot_config):
+        return
+    await state.set_state(AdminState.DEL_USER)
+    await callback.answer()
+    await callback.message.answer(
+        "➖ <b>Удаление пользователя</b>\n\nПришлите id, которому нужно закрыть доступ:",
+        parse_mode="HTML",
+        reply_markup=_cancel_keyboard("adm:panel"),
+    )
+
+
+async def _remove_users_from_text(
+    message: Message, raw: str, bot_config: BotConfig,
+    store: Optional[UserStore], state: FSMContext,
+) -> None:
+    ids, _note = _parse_user_ids(raw)
+    if not ids:
+        await message.answer("Не вижу числовой id. Пример: <code>123456789</code>",
+                             parse_mode="HTML")
+        return
+    results = []
+    for user_id in ids:
+        if user_id in bot_config.admin_ids:
+            results.append(f"🚫 <code>{user_id}</code> — администратор, удалить нельзя.")
+            continue
+        if user_id in bot_config.allowed_user_ids:
+            results.append(
+                f"ℹ️ <code>{user_id}</code> задан в conf.ini (ALLOWED_USER_IDS) — "
+                "уберите его там, чтобы закрыть доступ."
+            )
+            continue
+        if store is not None and store.remove(user_id):
+            results.append(f"✅ Доступ для <code>{user_id}</code> закрыт.")
+        else:
+            results.append(f"ℹ️ <code>{user_id}</code> не найден в списке добавленных.")
+    await state.clear()
+    await message.answer(
+        "\n".join(results) + "\n\n" + _access_panel_text(store, bot_config),
+        parse_mode="HTML",
+        reply_markup=_access_panel_keyboard(),
+    )
+
+
+@router.message(AdminState.DEL_USER)
+async def process_admin_del(
+    message: Message,
+    state: FSMContext,
+    bot_config: BotConfig,
+    user_store: Optional[UserStore] = None,
+) -> None:
+    if not await _require_admin_message(message, bot_config):
+        return
+    await _remove_users_from_text(message, message.text or "", bot_config, user_store, state)
+
+
+@router.callback_query(F.data.startswith("adm:add:"))
+async def cb_admin_quick_add(
+    callback: CallbackQuery,
+    bot_config: BotConfig,
+    user_store: Optional[UserStore] = None,
+) -> None:
+    """Быстрое добавление из уведомления о запросе доступа."""
+    if not await _require_admin_callback(callback, bot_config):
+        return
+    try:
+        user_id = int(callback.data.split(":")[-1])
+    except (ValueError, IndexError):
+        await callback.answer("Некорректный id", show_alert=True)
+        return
+
+    created = user_store is not None and user_id not in user_store
+    await _add_user(callback.bot, user_id, note="",
+                    added_by=callback.from_user.id, store=user_store)
+    await callback.answer("Доступ открыт" if created else "Уже в списке")
+    try:
+        await callback.message.edit_text(
+            f"🔔 Запрос доступа от <code>{user_id}</code> обработан: "
+            + ("доступ открыт ✅" if created else "пользователь уже был в списке ℹ️"),
+            parse_mode="HTML",
+        )
+    except TelegramBadRequest:
+        pass
+
+
+@router.callback_query(F.data.startswith("adm:skip:"))
+async def cb_admin_quick_skip(callback: CallbackQuery, bot_config: BotConfig) -> None:
+    if not await _require_admin_callback(callback, bot_config):
+        return
+    await callback.answer("Отклонено")
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except TelegramBadRequest:
+        pass
 
 
 @router.message(Command("warmup"))
@@ -296,10 +830,9 @@ async def cmd_parse(
     else:
         await state.set_state(WizardState.CHANNELS)
         await message.answer(
-            "📋 <b>Шаг 1: Каналы</b>\n\n"
-            "Пришлите список каналов для парсинга (через запятую, точку с запятой или с новой строки):\n"
-            "<i>Пример: @channel1, t.me/channel2, 1234567890 (id — без -100)</i>",
+            _channels_step_text(),
             parse_mode="HTML",
+            reply_markup=_cancel_keyboard(),
         )
 
 
@@ -422,8 +955,9 @@ async def cb_validate_restart(callback: CallbackQuery, state: FSMContext, bot_co
     await state.clear()
     await state.set_state(WizardState.CHANNELS)
     await callback.message.edit_text(
-        "📋 <b>Шаг 1: Каналы</b>\n\nПришлите список каналов для парсинга заново:",
+        _channels_step_text(),
         parse_mode="HTML",
+        reply_markup=_cancel_keyboard(),
     )
     await callback.answer()
 
@@ -439,6 +973,16 @@ async def cb_validate_continue(callback: CallbackQuery, state: FSMContext, bot_c
     await _show_scope_step(callback.message, state)
 
 
+def _channels_step_text() -> str:
+    """Текст шага 1: приём списка каналов."""
+    return (
+        "📋 <b>Шаг 1 из 3 · Каналы</b>\n\n"
+        "Пришлите каналы для парсинга — один или несколько, через запятую, "
+        "точку с запятой или с новой строки.\n"
+        "<i>Например: @some_channel, t.me/another, my_channel</i>"
+    )
+
+
 async def _show_scope_step(message: Message, state: FSMContext) -> None:
     await state.set_state(WizardState.SCOPE)
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -448,11 +992,17 @@ async def _show_scope_step(message: Message, state: FSMContext) -> None:
         ],
         [
             InlineKeyboardButton(text="По годам", callback_data="scope_years"),
-        ]
+        ],
+        [
+            InlineKeyboardButton(text="⏹ Отмена", callback_data="wiz:cancel"),
+        ],
     ])
     text = (
-        "📊 <b>Шаг 2: Диапазон парсинга</b>\n\n"
-        "Выберите, какие посты анализировать (выбор применяется одинаково ко всем каналам):"
+        "📊 <b>Шаг 2 из 3 · Диапазон постов</b>\n\n"
+        "Сколько последних постов проверять в каждом канале?\n\n"
+        "• <b>Все посты</b> — от последнего до самого первого\n"
+        "• <b>Последние N</b> — только свежие посты\n"
+        "• <b>По годам</b> — выбранные годы целиком"
     )
     if isinstance(message, Message) and message.from_user and message.from_user.is_bot:
         await message.edit_text(text, reply_markup=kb, parse_mode="HTML")
@@ -463,7 +1013,14 @@ async def _show_scope_step(message: Message, state: FSMContext) -> None:
 @router.callback_query(WizardState.SCOPE, F.data == "scope_all")
 async def cb_scope_all(callback: CallbackQuery, state: FSMContext, bot_config: BotConfig) -> None:
     _reset_user_idle_timer(callback.from_user.id, state, callback.bot, bot_config.wizard_idle_timeout)
-    await state.update_data(scope_type="all", limit=1_000_000, start_date=None, end_date=None, scope_desc="Все посты")
+    await state.update_data(
+        scope_type="all",
+        limit=UNLIMITED_LIMIT,
+        unlimited=True,
+        start_date=None,
+        end_date=None,
+        scope_desc="Все посты",
+    )
     await callback.answer()
     await _show_mode_step(callback.message, state, bot_config)
 
@@ -473,10 +1030,15 @@ async def cb_scope_n(callback: CallbackQuery, state: FSMContext, bot_config: Bot
     _reset_user_idle_timer(callback.from_user.id, state, callback.bot, bot_config.wizard_idle_timeout)
     await state.set_state(WizardState.SCOPE_N)
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data="scope_back")]
+        [
+            InlineKeyboardButton(text="⬅️ Назад", callback_data="scope_back"),
+            InlineKeyboardButton(text="⏹ Отмена", callback_data="wiz:cancel"),
+        ]
     ])
     await callback.message.edit_text(
-        "Введите количество последних постов для анализа (целое число от 1 до 1 000 000):",
+        "🔢 <b>Сколько последних постов проверить?</b>\n\n"
+        "Пришлите целое число от 1 до 1 000 000 (например: 500).",
+        parse_mode="HTML",
         reply_markup=kb,
     )
     await callback.answer()
@@ -500,10 +1062,13 @@ async def process_scope_n_msg(message: Message, state: FSMContext, bot_config: B
             raise ValueError()
     except (ValueError, TypeError):
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="scope_back")]
+            [
+                InlineKeyboardButton(text="⬅️ Назад", callback_data="scope_back"),
+                InlineKeyboardButton(text="⏹ Отмена", callback_data="wiz:cancel"),
+            ]
         ])
         await message.answer(
-            "Некорректное значение. Введите целое положительное число до 1 000 000 (например: 500):",
+            "Нужно целое число от 1 до 1 000 000. Попробуйте ещё раз (например: 500).",
             reply_markup=kb,
         )
         return
@@ -511,6 +1076,7 @@ async def process_scope_n_msg(message: Message, state: FSMContext, bot_config: B
     await state.update_data(
         scope_type="n",
         limit=n,
+        unlimited=False,
         start_date=None,
         end_date=None,
         scope_desc=f"Последние {n}",
@@ -590,7 +1156,8 @@ async def cb_year_done(callback: CallbackQuery, state: FSMContext, bot_config: B
     years_str = ", ".join(str(y) for y in sorted(selected))
     await state.update_data(
         scope_type="years",
-        limit=1_000_000,
+        limit=UNLIMITED_LIMIT,
+        unlimited=True,
         start_date=start_date.isoformat(),
         end_date=end_date.isoformat(),
         selected_years=list(selected),
@@ -611,9 +1178,13 @@ async def _show_mode_step(message: Message, state: FSMContext, bot_config: BotCo
         ],
         [
             InlineKeyboardButton(text="⬅️ Назад", callback_data="mode_back"),
+            InlineKeyboardButton(text="⏹ Отмена", callback_data="wiz:cancel"),
         ]
     ])
-    text = "🎯 <b>Шаг 3: Формат ответа</b>\n\nВыберите, кого включать в отчёт:"
+    text = (
+        "🎯 <b>Шаг 3 из 3 · Кого показывать</b>\n\n"
+        "В отчёт попадут все, кто отправлял звёзды, либо только крупные донатеры:"
+    )
     if isinstance(message, Message) and message.from_user and message.from_user.is_bot:
         await message.edit_text(text, reply_markup=kb, parse_mode="HTML")
     else:
@@ -693,7 +1264,8 @@ async def _run_parsing_task(
 ) -> None:
     meta = wizard_data.get("channels_meta", [])
     channels_raw = [c["raw"] for c in meta]
-    limit = int(wizard_data.get("limit", 1_000_000))
+    limit = int(wizard_data.get("limit", UNLIMITED_LIMIT))
+    unlimited = bool(wizard_data.get("unlimited"))
     s_date_str = wizard_data.get("start_date")
     e_date_str = wizard_data.get("end_date")
     start_date = datetime.fromisoformat(s_date_str) if s_date_str else None
@@ -727,11 +1299,14 @@ async def _run_parsing_task(
             sec_left = max(0, int((flood_until - datetime.now(timezone.utc)).total_seconds()))
             flood_str = f"\n⚠️ Ожидание Telegram FloodWait: {sec_left} сек."
 
-        tot_str = f"/{tot}" if tot else ""
+        bar = _progress_bar(scanned, tot or 0)
+        bar_line = f"{bar}\n" if bar else ""
+        tot_str = f" из {tot}" if tot else ""
         text = (
             f"🔄 <b>Парсинг канала:</b> {html.escape(ch)}\n"
-            f"Просмотрено: {scanned}{tot_str} (со звёздами: {with_stars}){flood_str}\n"
-            f"<i>Для отмены используйте /cancel</i>"
+            f"{bar_line}"
+            f"Обработано постов: <b>{scanned}</b>{tot_str} (со звёздами: {with_stars}){flood_str}\n"
+            f"<i>Отмена — /cancel</i>"
         )
         try:
             await bot.edit_message_text(text, chat_id=chat_id, message_id=status_msg_id, parse_mode="HTML")
@@ -771,7 +1346,7 @@ async def _run_parsing_task(
             channel_outcomes[str(ch_item)] = f"ошибка: {exc}"
             continue
 
-        ch_stats = ParseStats(requested=limit)
+        ch_stats = ParseStats()
         stats_by_channel[title] = ch_stats
 
         try:
@@ -783,6 +1358,7 @@ async def _run_parsing_task(
                 stats=ch_stats,
                 start_date=start_date,
                 end_date=end_date,
+                unlimited=unlimited,
                 progress_callback=_progress_cb,
                 selected_years=selected_years_set,
             )
@@ -806,6 +1382,7 @@ async def _run_parsing_task(
         chat_id=chat_id,
         status_msg_id=status_msg_id,
         all_records=all_records,
+        unlimited=unlimited,
         stats_by_channel=stats_by_channel,
         channel_outcomes=channel_outcomes,
         scope_desc=scope_desc,
@@ -830,6 +1407,7 @@ async def _send_final_results(
     bot_config: BotConfig,
     interrupted: bool,
     channels_meta: dict,
+    unlimited: bool = False,
 ) -> None:
     try:
         await bot.delete_message(chat_id=chat_id, message_id=status_msg_id)
@@ -859,6 +1437,7 @@ async def _send_final_results(
         stats_by_channel=stats_by_channel,
         requested_scope=scope_desc,
         output_path=target_xlsx_path,
+        records=all_records,
     )
 
     # Детализированный Excel, если DETAILED_EXCEL=true
@@ -879,6 +1458,7 @@ async def _send_final_results(
         threshold=bot_config.donor_threshold,
         only_above_threshold=only_above_threshold,
         stats_by_channel=stats_by_channel,
+        unlimited=unlimited,
     )
 
     if interrupted:

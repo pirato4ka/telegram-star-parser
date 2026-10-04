@@ -5,12 +5,23 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Sequence
 
-from models import NOT_FOUND, REACTOR_ANONYMOUS, StarRecord
+from models import (
+    ANONYMOUS_LABEL,
+    NOT_FOUND,
+    REACTOR_ANONYMOUS,
+    USERNAME_MISSING,
+    StarRecord,
+    looks_like_username,
+)
 
 
 @dataclass(slots=True)
 class DonorAggregate:
-    """Агрегированные данные по одному донатеру."""
+    """Агрегированные данные по одному донатеру.
+
+    `reactor_username` — либо настоящий username, либо «отсутствует»
+    (`models.USERNAME_MISSING`), если у донатера его нет.
+    """
 
     rank: int = 0
     reactor_username: str = ""
@@ -19,6 +30,10 @@ class DonorAggregate:
     stars_total: int = 0
     posts_count: int = 0
     channels: list[str] = field(default_factory=list)
+    # Сколько записей (донатов) пришло от этого донатера.
+    entries: int = 0
+    # Имя/фамилия или `not_found`: нужно только для логов и отладки.
+    display_name: str = ""
 
 
 def aggregate_star_records(
@@ -46,12 +61,14 @@ def aggregate_star_records(
 
     donors_by_id: dict[int, dict] = {}
     anon_stars = 0
+    anon_entries = 0
     anon_posts: set[tuple[str, int]] = set()
     anon_channels: set[str] = set()
 
     for r in records:
         if r.reactor_type == REACTOR_ANONYMOUS or r.reactor_id is None:
             anon_stars += r.stars_count
+            anon_entries += 1
             anon_posts.add((r.current_channel, r.current_message_id))
             if r.current_channel:
                 anon_channels.add(r.current_channel)
@@ -59,37 +76,37 @@ def aggregate_star_records(
 
         rid = r.reactor_id
         if rid not in donors_by_id:
-            # определяем reactor_username и reactor_type
-            # username / имя либо not_found
-            r_type = r.reactor_type
-            uname = r.reactor_username or ""
-            if uname == NOT_FOUND:
-                display_name = f"id{rid} (not_found)"
-            else:
-                display_name = uname or f"id{rid}"
-
+            uname = str(r.reactor_username or "")
+            has_username = bool(r.reactor_has_username or looks_like_username(uname))
             donors_by_id[rid] = {
                 "id": rid,
-                "username": display_name,
-                "raw_username": uname,
-                "type": r_type,
+                "username": uname if has_username else USERNAME_MISSING,
+                "display_name": uname or f"id{rid}",
+                "type": r.reactor_type,
                 "stars": 0,
                 "posts": set(),
                 "channels": set(),
+                "entries": 0,
+                "has_username": has_username,
                 "is_not_found": (uname == NOT_FOUND),
             }
 
         entry = donors_by_id[rid]
         entry["stars"] += r.stars_count
+        entry["entries"] += 1
         entry["posts"].add((r.current_channel, r.current_message_id))
         if r.current_channel:
             entry["channels"].add(r.current_channel)
-        # Если ранее было not_found, но встретилось расшифрованное имя
-        if entry["is_not_found"] and r.reactor_username and r.reactor_username != NOT_FOUND:
-            entry["username"] = r.reactor_username
-            entry["raw_username"] = r.reactor_username
-            entry["type"] = r.reactor_type
-            entry["is_not_found"] = False
+        # Если username не был известен, а в другой записи он нашёлся — берём его.
+        if not entry["has_username"]:
+            candidate = str(r.reactor_username or "")
+            if r.reactor_has_username or looks_like_username(candidate):
+                entry["username"] = candidate
+                entry["has_username"] = True
+            if entry["is_not_found"] and candidate != NOT_FOUND:
+                entry["is_not_found"] = False
+                entry["display_name"] = candidate or f"id{rid}"
+                entry["type"] = r.reactor_type
 
     named_donors: list[DonorAggregate] = []
     not_found_donors: list[DonorAggregate] = []
@@ -107,6 +124,8 @@ def aggregate_star_records(
             stars_total=stars,
             posts_count=len(data["posts"]),
             channels=sorted(data["channels"]),
+            entries=data["entries"],
+            display_name=data["display_name"],
         )
         if data["is_not_found"]:
             not_found_donors.append(donor)
@@ -137,12 +156,14 @@ def aggregate_star_records(
     if anon_stars > 0 or anon_posts:
         anon_aggregate = DonorAggregate(
             rank=len(combined) + 1,
-            reactor_username="(анонимы)",
+            reactor_username=ANONYMOUS_LABEL,
             reactor_id=None,
             reactor_type=REACTOR_ANONYMOUS,
             stars_total=anon_stars,
             posts_count=len(anon_posts),
             channels=sorted(anon_channels),
+            entries=anon_entries,
+            display_name=ANONYMOUS_LABEL,
         )
 
     return combined, anon_aggregate

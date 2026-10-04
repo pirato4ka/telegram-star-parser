@@ -15,6 +15,7 @@ from bot.access import AccessMiddleware
 from bot.config_bot import BotConfigError, load_bot_config
 from bot.handlers_bot import router
 from bot.queue_service import QueueService
+from bot.user_store import USERS_FILE_NAME, UserStore
 from client import build_client
 from config import ConfigError, load_config
 from utils import get_base_dir, setup_logger
@@ -56,6 +57,14 @@ async def main() -> None:
 
     logger.info("Telethon-клиент успешно подключен.")
 
+    # 3.1. Пользователи, добавленные администратором прямо в боте
+    user_store = UserStore(base_dir / USERS_FILE_NAME)
+    if not bot_config.admin_ids:
+        logger.warning(
+            "ADMIN_IDS не задан: добавлять пользователей по id через бота некому, "
+            "доступ определяется только ALLOWED_USER_IDS и users.json."
+        )
+
     # 4. Инициализация aiogram
     bot = Bot(token=bot_config.token)
     storage = MemoryStorage()
@@ -70,15 +79,23 @@ async def main() -> None:
     dp["app_config"] = app_config
     dp["telethon_client"] = client
     dp["queue_service"] = queue_service
+    dp["user_store"] = user_store
 
-    # Middleware доступа
-    access_middleware = AccessMiddleware(bot_config.allowed_user_ids)
+    # Middleware доступа: админы + статический whitelist + users.json
+    access_middleware = AccessMiddleware(
+        bot_config.allowed_user_ids,
+        admins=bot_config.admin_ids,
+        store=user_store,
+    )
     dp.message.middleware(access_middleware)
     dp.callback_query.middleware(access_middleware)
 
     dp.include_router(router)
 
-    logger.info("Бот запускается... Whitelist пользователей: %d", len(bot_config.allowed_user_ids))
+    logger.info(
+        "Бот запускается... доступ: %d из conf.ini + %d добавленных, администраторов: %d",
+        len(bot_config.allowed_user_ids), len(user_store), len(bot_config.admin_ids),
+    )
     try:
         await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
     finally:

@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -24,8 +25,17 @@ from bot.queue_service import (
     STATUS_PENDING,
     STATUS_RUNNING,
 )
-from exporter import DONOR_COLUMNS, export_donors_summary
-from models import NOT_FOUND, REACTOR_ANONYMOUS, REACTOR_CHANNEL, REACTOR_USER, ParseStats, StarRecord
+from bot.user_store import UserStore
+from exporter import DONOR_COLUMNS, DONATION_COLUMNS, export_donors_summary
+from models import (
+    NOT_FOUND,
+    REACTOR_ANONYMOUS,
+    REACTOR_CHANNEL,
+    REACTOR_USER,
+    USERNAME_MISSING,
+    ParseStats,
+    StarRecord,
+)
 import pandas as pd
 import openpyxl
 
@@ -85,12 +95,17 @@ def test_bot_config_validation():
 def test_aggregate_records():
     records = [
         # alice: 2 поста, 100 + 50 звёзд = 150
-        StarRecord("text", REACTOR_USER, "@ch1", 1, "@ch1", 1, "alice", 101, 100),
-        StarRecord("text", REACTOR_USER, "@ch1", 2, "@ch1", 2, "alice", 101, 50),
+        StarRecord("text", REACTOR_USER, "@ch1", 1, "@ch1", 1, "alice", 101, 100,
+                   reactor_has_username=True),
+        StarRecord("text", REACTOR_USER, "@ch1", 2, "@ch1", 2, "alice", 101, 50,
+                   reactor_has_username=True),
         # bob: 1 пост, 200 звёзд
-        StarRecord("text", REACTOR_USER, "@ch1", 1, "@ch1", 1, "bob", 102, 200),
+        StarRecord("text", REACTOR_USER, "@ch1", 1, "@ch1", 1, "bob", 102, 200,
+                   reactor_has_username=True),
         # not_found: 1 пост, 30 звёзд
         StarRecord("text", REACTOR_USER, "@ch1", 3, "@ch1", 3, NOT_FOUND, 103, 30),
+        # донатер без username (в отчёте — «отсутствует»)
+        StarRecord("text", REACTOR_USER, "@ch1", 4, "@ch1", 4, "Иван Иванов", 104, 5),
         # anonymous: 2 поста, 20 + 10 звёзд = 30
         StarRecord("text", REACTOR_ANONYMOUS, "@ch1", 1, "@ch1", 1, "", None, 20),
         StarRecord("text", REACTOR_ANONYMOUS, "@ch2", 5, "@ch2", 5, "", None, 10),
@@ -98,8 +113,8 @@ def test_aggregate_records():
 
     donors, anon = aggregate_star_records(records, threshold=80, only_above_threshold=False)
 
-    # Порядок: bob (200), alice (150), id103 (not_found) (30)
-    assert len(donors) == 3
+    # Порядок: bob (200), alice (150), id103 (not_found) (30), Иван Иванов (5)
+    assert len(donors) == 4
     assert donors[0].reactor_username == "bob"
     assert donors[0].stars_total == 200
     assert donors[0].rank == 1
@@ -109,14 +124,22 @@ def test_aggregate_records():
     assert donors[1].posts_count == 2
     assert donors[1].rank == 2
 
-    assert donors[2].reactor_username == "id103 (not_found)"
-    assert donors[2].stars_total == 30
+    # Именованные донатеры идут перед блоком not_found (§8)
+    assert donors[2].reactor_username == USERNAME_MISSING  # у донатера нет username
+    assert donors[2].reactor_id == 104
+    assert donors[2].stars_total == 5
     assert donors[2].rank == 3
+
+    assert donors[3].reactor_username == USERNAME_MISSING  # not_found -> «отсутствует»
+    assert donors[3].reactor_id == 103
+    assert donors[3].stars_total == 30
+    assert donors[3].rank == 4
 
     assert anon is not None
     assert anon.reactor_username == "(анонимы)"
     assert anon.stars_total == 30
     assert anon.posts_count == 2
+    assert anon.entries == 2  # две анонимные отправки звёзд
     assert set(anon.channels) == {"@ch1", "@ch2"}
 
     # Режим с фильтром по порогу (> 80)
@@ -132,7 +155,16 @@ def test_export_donors_summary():
     donors = [
         DonorAggregate(rank=1, reactor_username="bob", reactor_id=102, reactor_type="user", stars_total=200, posts_count=1, channels=["@ch1"]),
         DonorAggregate(rank=2, reactor_username="alice", reactor_id=101, reactor_type="user", stars_total=150, posts_count=2, channels=["@ch1"]),
-        DonorAggregate(rank=3, reactor_username="(анонимы)", reactor_id=None, reactor_type="anonymous", stars_total=30, posts_count=2, channels=["@ch1", "@ch2"]),
+        DonorAggregate(rank=3, reactor_username=USERNAME_MISSING, reactor_id=103, reactor_type="user", stars_total=30, posts_count=1, channels=["@ch1"]),
+        DonorAggregate(rank=4, reactor_username="(анонимы)", reactor_id=None, reactor_type="anonymous", stars_total=30, posts_count=2, channels=["@ch1", "@ch2"]),
+    ]
+    records = [
+        StarRecord("photo", REACTOR_USER, "@ch1", 1, "@ch1", 1, "bob", 102, 200,
+                   "https://t.me/ch1/1", reactor_has_username=True),
+        StarRecord("video(forward)", REACTOR_USER, "@ch1", 2, "src", 77, "Иван", 104, 5,
+                   "https://t.me/ch1/2"),
+        StarRecord("text", REACTOR_ANONYMOUS, "@ch2", 3, "@ch2", 3, "", None, 30,
+                   "https://t.me/ch2/3"),
     ]
     stats = {
         "@ch1": ParseStats(requested=100, scanned=90, errors=1, unparsed=0, not_found=1),
@@ -146,22 +178,61 @@ def test_export_donors_summary():
             stats_by_channel=stats,
             requested_scope="Последние 100",
             output_path=str(out_path),
+            records=records,
         )
         assert Path(saved).exists()
 
         wb = openpyxl.load_workbook(saved)
-        assert "Donors" in wb.sheetnames
-        assert "Summary" in wb.sheetnames
+        assert wb.sheetnames == ["Донаты", "Сводка", "Инфо"]
 
-        ws_donors = wb["Donors"]
-        headers = [cell.value for cell in ws_donors[1]]
-        assert headers == list(DONOR_COLUMNS)
+        # Лист «Донаты»: поля 1:1 как на согласованном образце
+        ws_donations = wb["Донаты"]
+        headers = [cell.value for cell in ws_donations[1]]
+        assert headers == list(DONATION_COLUMNS)
+        rows = list(ws_donations.iter_rows(values_only=True))[1:]
+        assert len(rows) == 3
+        idx = {name: position for position, name in enumerate(DONATION_COLUMNS)}
+        assert rows[0][idx["current_channel"]] == "@ch1"
+        assert rows[0][idx["stars_count"]] == 200
+        assert rows[0][idx["post_link"]] == "https://t.me/ch1/1"
+        # username донатера есть — пишем как есть; нет — «отсутствует»
+        assert rows[0][idx["reactor_username"]] == "bob"
+        assert rows[1][idx["reactor_username"]] == USERNAME_MISSING
+        assert rows[2][idx["reactor_username"]] == USERNAME_MISSING
+        # ссылки кликабельны
+        assert ws_donations.cell(row=2, column=idx["post_link"] + 1).hyperlink is not None
 
-        ws_summary = wb["Summary"]
+        # Лист «Сводка»
+        ws_donors = wb["Сводка"]
+        assert [cell.value for cell in ws_donors[1]] == [
+            "№", "username", "id", "тип", "звёзд всего", "постов", "каналы",
+        ]
+
+        # Лист «Инфо»
+        ws_summary = wb["Инфо"]
         summary_rows = {row[0]: row[1] for row in ws_summary.iter_rows(values_only=True) if row[0] is not None}
         assert summary_rows.get("Диапазон парсинга") == "Последние 100"
-        assert summary_rows.get("Обработано сообщений (scanned)") == 90
+        assert summary_rows.get("Обработано постов") == "90 из 100"
+        assert summary_rows.get("Записей о донатах") == 3
         assert summary_rows.get("Результат неполный") == "Да"  # т.к. errors=1
+
+
+def test_export_without_requested_limit():
+    """«Все посты»: в отчёте не должно быть «из 1000000»."""
+    stats = {"@ch": ParseStats(requested=None, scanned=6957, exhausted=True)}
+    with tempfile.TemporaryDirectory() as tmpdir:
+        saved = export_donors_summary(
+            donors=[],
+            channels_meta={"@ch": {}},
+            stats_by_channel=stats,
+            requested_scope="Все посты",
+            output_path=str(Path(tmpdir) / "r.xlsx"),
+            records=[],
+        )
+        wb = openpyxl.load_workbook(saved)
+        summary_rows = {row[0]: row[1] for row in wb["Инфо"].iter_rows(values_only=True) if row[0]}
+        assert summary_rows["Обработано постов"] == "6957"
+        assert "1000000" not in str(summary_rows["Обработано постов"])
 
 
 def test_formatting_table():
@@ -179,8 +250,27 @@ def test_formatting_table():
     # Проверяем экранирование HTML
     assert "&lt;tag&gt;" in msgs[0]
     assert "<tag>" not in msgs[0]
-    assert "1 донатера, 120 звёзд (включая анонимов)" in msgs[0]
-    assert "Обработано:" in msgs[0]
+    plain = re.sub(r"<[^>]+>", "", msgs[0])
+    assert "1 донатер, 120 звёзд (включая анонимов)" in plain
+    # Совпадающие числа не дублируются: «Обработано: 50», а не «50 из 50»
+    assert "Обработано: 50." in plain
+
+    # Если план и факт расходятся, видно оба числа
+    partial = format_donors_table(
+        donors, anon, ["@ch"], threshold=80, only_above_threshold=False,
+        stats_by_channel={"@ch": ParseStats(requested=100, scanned=90)},
+    )
+    assert "Обработано: 90 из 100" in re.sub(r"<[^>]+>", "", partial[0])
+
+    # Режим «все посты»: лимит не показывается как «из 1000000»
+    msgs_all = format_donors_table(
+        donors, anon, ["@ch"], threshold=80, only_above_threshold=False,
+        stats_by_channel={"@ch": ParseStats(requested=None, scanned=6957)},
+        unlimited=True,
+    )
+    plain_all = re.sub(r"<[^>]+>", "", msgs_all[0])
+    assert "Обработано: 6957." in plain_all
+    assert "1000000" not in plain_all
 
 
 def test_queue_service_fifo_and_cancellation():

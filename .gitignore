@@ -1,6 +1,7 @@
 # Конфигурация и сессии — не коммитим
 conf.ini
 *.session
+users.json
 *.session-journal
 
 # Результаты работы

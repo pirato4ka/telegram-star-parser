@@ -17,9 +17,9 @@ from bot.handlers_bot import router
 from bot.queue_service import QueueService
 from client import build_client
 from config import ConfigError, load_config
-from utils import setup_logger
+from utils import get_base_dir, setup_logger
 
-logger = setup_logger("bot", log_file="bot.log")
+logger = setup_logger(get_base_dir(), log_file_name="bot.log")
 
 
 async def main() -> None:

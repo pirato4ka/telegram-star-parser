@@ -23,22 +23,24 @@ logger = setup_logger(get_base_dir(), log_file_name="bot.log")
 
 
 async def main() -> None:
+    base_dir = get_base_dir()
+
     # 1. Загрузка конфигурации бота
     try:
-        bot_config = load_bot_config()
+        bot_config = load_bot_config(base_dir / "conf.ini")
     except BotConfigError as exc:
         sys.stderr.write(f"Ошибка конфигурации бота: {exc}\n")
         sys.exit(1)
 
     # 2. Загрузка конфигурации ядра Telethon
     try:
-        app_config = load_config(get_base_dir())
+        app_config = load_config(base_dir)
     except ConfigError as exc:
         sys.stderr.write(f"Ошибка конфигурации ядра: {exc}\n")
         sys.exit(1)
 
     # 3. Создание Telethon-клиента (единый loop)
-    client = build_client(app_config)
+    client = build_client(app_config, base_dir)
     try:
         await client.connect()
         if not await client.is_user_authorized():

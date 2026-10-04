@@ -12,7 +12,13 @@ import pandas as pd
 from openpyxl.styles import Alignment, Font
 from openpyxl.utils import get_column_letter
 
-from models import COLUMNS, EXCEL_SHEET_NAME, ParseStats, StarRecord
+from models import (
+    COLUMNS,
+    EXCEL_SHEET_NAME,
+    ParseStats,
+    StarRecord,
+    USERNAME_MISSING,
+)
 from utils import (
     ILLEGAL_FILENAME_CHARS,
     WINDOWS_RESERVED_NAMES,
@@ -25,6 +31,14 @@ from utils import (
 if TYPE_CHECKING:
     from bot.aggregate import DonorAggregate
 
+# --- Лист «Донаты»: одна строка = один донат (пост + отправитель + звёзды) ---- #
+# Поля 1:1 как на согласованном образце (скриншот 2): каждый донат отдельной
+# строкой, со ссылкой на пост и количеством звёзд.
+DONATION_COLUMNS = COLUMNS
+
+DONATION_HEADERS = {name: name for name in DONATION_COLUMNS}
+
+# --- Лист «Сводка»: агрегация по донатерам ------------------------------------ #
 DONOR_COLUMNS = (
     "rank",
     "reactor_username",
@@ -34,6 +48,20 @@ DONOR_COLUMNS = (
     "posts_count",
     "channels",
 )
+
+DONOR_HEADERS = {
+    "rank": "№",
+    "reactor_username": "username",
+    "reactor_id": "id",
+    "reactor_type": "тип",
+    "stars_total": "звёзд всего",
+    "posts_count": "постов",
+    "channels": "каналы",
+}
+
+DONATIONS_SHEET_NAME = "Донаты"
+DONORS_SHEET_NAME = "Сводка"
+INFO_SHEET_NAME = "Инфо"
 
 logger = get_logger("exporter")
 
@@ -122,7 +150,11 @@ def unique_path(directory: Path, filename: str,
 # Таблица
 # --------------------------------------------------------------------------- #
 def build_dataframe(records: Sequence[StarRecord]) -> pd.DataFrame:
-    """Собирает DataFrame из записей (пустой — с правильными колонками)."""
+    """Собирает DataFrame из записей (пустой — с правильными колонками).
+
+    Значения колонок — «сырые», как их определил парсер: в `reactor_username`
+    username, иначе имя, иначе `not_found` (у анонимных пусто).
+    """
     rows = [[clean_cell_value(value) for value in record.to_row()] for record in records]
     frame = pd.DataFrame(rows, columns=list(COLUMNS), dtype=object)
     return frame
@@ -228,27 +260,64 @@ def export_records(
     return None
 
 
+def build_donation_rows(records: Sequence[StarRecord]) -> list[dict]:
+    """Строки листа «Донаты»: каждый донат отдельно, со ссылкой на пост.
+
+    Состав, порядок и значения полей — как на согласованном образце (скриншот 2):
+    `message_type`, `reactor_type`, `current_channel`, `current_message_id`,
+    `post_link`, `original_channel`, `original_message_id`, `reactor_username`,
+    `reactor_id`, `stars_count`.
+
+    В `reactor_username` попадает то, что определил парсер: username, иначе имя
+    и фамилия, при неудаче — `not_found`, у анонимных — пусто. Вариант
+    «отсутствует» используется только в текстовой таблице чата.
+    """
+    rows: list[dict] = []
+    for record in records:
+        row = record.to_dict()
+        rows.append({name: clean_cell_value(row[name]) for name in DONATION_COLUMNS})
+    return rows
+
+
 def export_donors_summary(
     donors: list[DonorAggregate],
     channels_meta: dict,
     stats_by_channel: dict[str, ParseStats],
     requested_scope: str,
     output_path: str,
+    records: Optional[Sequence[StarRecord]] = None,
 ) -> str:
-    """Формирует Excel-файл со сводкой донатеров (листы Donors и Summary).
+    """Формирует Excel-отчёт бота.
+
+    Листы:
+    * «Донаты» — каждая отправка звёзд отдельной строкой: поля 1:1 как на
+      согласованном образце (`message_type`, `reactor_type`, `current_channel`,
+      `current_message_id`, `post_link`, `original_channel`, `original_message_id`,
+      `reactor_username`, `reactor_id`, `stars_count`). В `reactor_username` —
+      username, иначе имя, иначе `not_found` (у анонимных пусто), как в образце;
+    * «Сводка» — агрегация по донатерам (кто сколько всего отправил);
+    * «Инфо» — параметры парсинга и полнота результата.
 
     Возвращает абсолютный путь к сохранённому файлу.
     """
     path = Path(output_path).resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    # 1. Лист Donors
+    # 1. Лист «Донаты» — построчно, без суммирования
+    donation_rows = build_donation_rows(records or [])
+    df_donations = pd.DataFrame(
+        [[row[name] for name in DONATION_COLUMNS] for row in donation_rows],
+        columns=list(DONATION_COLUMNS),
+    )
+    df_donations = df_donations.rename(columns=DONATION_HEADERS)
+
+    # 2. Лист «Сводка» — агрегация по донатерам
     donor_rows = []
     for d in donors:
         channels_str = ", ".join(d.channels) if isinstance(d.channels, (list, set, tuple)) else str(d.channels or "")
         donor_rows.append({
             "rank": d.rank,
-            "reactor_username": clean_cell_value(d.reactor_username),
+            "reactor_username": clean_cell_value(d.reactor_username) or USERNAME_MISSING,
             "reactor_id": d.reactor_id if d.reactor_id is not None else "",
             "reactor_type": d.reactor_type,
             "stars_total": d.stars_total,
@@ -257,16 +326,18 @@ def export_donors_summary(
         })
 
     df_donors = pd.DataFrame(donor_rows, columns=list(DONOR_COLUMNS))
+    df_donors = df_donors.rename(columns=DONOR_HEADERS)
 
-    # 2. Лист Summary
-    # Список каналов, диапазон парсинга, дата формирования, суммарно scanned/requested,
-    # errors+unparsed, not_found, anonymous, флаг «результат неполный»
-    total_requested = sum(s.requested for s in stats_by_channel.values()) if stats_by_channel else 0
+    # 3. Лист «Инфо» — параметры парсинга
+    requested_values = [s.requested for s in stats_by_channel.values()] if stats_by_channel else []
+    total_requested = sum(v for v in requested_values if v) if any(v for v in requested_values) else 0
     total_scanned = sum(s.scanned for s in stats_by_channel.values()) if stats_by_channel else 0
     total_errors = sum(s.errors for s in stats_by_channel.values()) if stats_by_channel else 0
     total_unparsed = sum(s.unparsed for s in stats_by_channel.values()) if stats_by_channel else 0
     total_not_found = sum(s.not_found for s in stats_by_channel.values()) if stats_by_channel else 0
     total_anon = sum(1 for d in donors if d.reactor_type == "anonymous")
+    total_stars = sum(d.stars_total for d in donors)
+    total_donations = len(donation_rows)
 
     is_incomplete = (total_errors + total_unparsed) > 0 or any(s.interrupted for s in stats_by_channel.values())
 
@@ -274,12 +345,17 @@ def export_donors_summary(
     if not channel_names_list and channels_meta:
         channel_names_list = list(channels_meta.keys())
 
+    processed_value = str(total_scanned)
+    if total_requested and total_requested != total_scanned:
+        processed_value = f"{total_scanned} из {total_requested}"
+
     summary_data = [
         {"Параметр": "Список каналов", "Значение": ", ".join(channel_names_list)},
         {"Параметр": "Диапазон парсинга", "Значение": requested_scope},
         {"Параметр": "Дата формирования", "Значение": datetime.now().strftime("%Y-%m-%d %H:%M:%S")},
-        {"Параметр": "Обработано сообщений (scanned)", "Значение": total_scanned},
-        {"Параметр": "Запрошено сообщений (requested)", "Значение": total_requested},
+        {"Параметр": "Записей о донатах", "Значение": total_donations},
+        {"Параметр": "Всего звёзд", "Значение": total_stars},
+        {"Параметр": "Обработано постов", "Значение": processed_value},
         {"Параметр": "Ошибок и непрочитанных (errors + unparsed)", "Значение": total_errors + total_unparsed},
         {"Параметр": "Не расшифровано (not_found)", "Значение": total_not_found},
         {"Параметр": "Анонимных записей (anonymous)", "Значение": total_anon},
@@ -288,18 +364,22 @@ def export_donors_summary(
     df_summary = pd.DataFrame(summary_data)
 
     with pd.ExcelWriter(path, engine="openpyxl") as writer:
-        df_donors.to_excel(writer, sheet_name="Donors", index=False)
-        _style_donors_worksheet(writer.sheets["Donors"], df_donors)
+        df_donations.to_excel(writer, sheet_name=DONATIONS_SHEET_NAME, index=False)
+        _style_donations_worksheet(writer.sheets[DONATIONS_SHEET_NAME], df_donations)
 
-        df_summary.to_excel(writer, sheet_name="Summary", index=False)
-        _style_summary_worksheet(writer.sheets["Summary"], df_summary)
+        df_donors.to_excel(writer, sheet_name=DONORS_SHEET_NAME, index=False)
+        _style_donors_worksheet(writer.sheets[DONORS_SHEET_NAME], df_donors)
 
-    logger.info("Excel сводки донатеров сохранён: %s", path)
+        df_summary.to_excel(writer, sheet_name=INFO_SHEET_NAME, index=False)
+        _style_summary_worksheet(writer.sheets[INFO_SHEET_NAME], df_summary)
+
+    logger.info("Excel-отчёт бота сохранён: %s (донатов: %d, донатеров: %d)",
+                path, total_donations, len(donors))
     return str(path)
 
 
-def _style_donors_worksheet(worksheet, frame: pd.DataFrame) -> None:
-    """Оформление листа Donors."""
+def _style_donations_worksheet(worksheet, frame: pd.DataFrame) -> None:
+    """Оформление листа «Донаты»: шапка, фильтр, кликабельные ссылки, целые числа."""
     header_font = Font(bold=True)
     for cell in worksheet[1]:
         cell.font = header_font
@@ -310,8 +390,46 @@ def _style_donors_worksheet(worksheet, frame: pd.DataFrame) -> None:
         last_column = get_column_letter(len(frame.columns))
         worksheet.auto_filter.ref = f"A1:{last_column}1"
 
-    # rank, reactor_id, stars_total, posts_count — целыми числами
-    int_cols = ("rank", "reactor_id", "stars_total", "posts_count")
+    headers = list(frame.columns)
+    for column_name in INTEGER_COLUMNS:
+        if column_name not in headers:
+            continue
+        letter = get_column_letter(headers.index(column_name) + 1)
+        for cell in worksheet[letter][1:]:
+            if cell.value is None or str(cell.value).strip() == "":
+                continue
+            try:
+                cell.value = int(cell.value)
+                cell.number_format = "0"
+            except (ValueError, TypeError):
+                pass
+
+    if "post_link" in headers:
+        link_letter = get_column_letter(headers.index("post_link") + 1)
+        link_font = Font(color="0563C1", underline="single")
+        for cell in worksheet[link_letter][1:]:
+            value = str(cell.value or "")
+            if value.startswith(("https://", "http://")):
+                cell.hyperlink = value
+                cell.font = link_font
+
+    _autosize(worksheet, frame)
+
+
+def _style_donors_worksheet(worksheet, frame: pd.DataFrame) -> None:
+    """Оформление листа «Сводка»."""
+    header_font = Font(bold=True)
+    for cell in worksheet[1]:
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="left", vertical="center")
+
+    worksheet.freeze_panes = "A2"
+    if len(frame.columns):
+        last_column = get_column_letter(len(frame.columns))
+        worksheet.auto_filter.ref = f"A1:{last_column}1"
+
+    # №, id, звёзд всего, постов — целыми числами
+    int_cols = tuple(DONOR_HEADERS[key] for key in ("rank", "reactor_id", "stars_total", "posts_count"))
     for col_name in int_cols:
         if col_name not in frame.columns:
             continue
@@ -329,7 +447,7 @@ def _style_donors_worksheet(worksheet, frame: pd.DataFrame) -> None:
 
 
 def _style_summary_worksheet(worksheet, frame: pd.DataFrame) -> None:
-    """Оформление листа Summary."""
+    """Оформление листа «Инфо»."""
     header_font = Font(bold=True)
     for cell in worksheet[1]:
         cell.font = header_font
@@ -340,6 +458,9 @@ def _style_summary_worksheet(worksheet, frame: pd.DataFrame) -> None:
 
 
 __all__ = [
-    "DONOR_COLUMNS", "build_dataframe", "build_result_filename", "export_donors_summary",
-    "export_records", "safe_filename", "unique_path", "write_excel",
+    "DONATION_COLUMNS", "DONATION_HEADERS", "DONATIONS_SHEET_NAME", "DONOR_COLUMNS",
+    "DONOR_HEADERS", "DONORS_SHEET_NAME", "INFO_SHEET_NAME",
+    "build_dataframe", "build_donation_rows", "build_result_filename",
+    "export_donors_summary", "export_records", "safe_filename", "unique_path",
+    "write_excel",
 ]

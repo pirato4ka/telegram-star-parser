@@ -31,6 +31,7 @@ class BotConfigError(Exception):
 class BotConfig:
     token: str
     allowed_user_ids: set[int] = field(default_factory=set)
+    admin_ids: set[int] = field(default_factory=set)
     max_concurrent_tasks: int = 1
     progress_edit_interval: int = DEFAULT_PROGRESS_EDIT_INTERVAL
     donor_threshold: int = DEFAULT_DONOR_THRESHOLD
@@ -47,6 +48,20 @@ def _parse_bool(value: str, default: bool = False) -> bool:
     if val in ("false", "0", "no", "n", "off"):
         return False
     return default
+
+
+def _parse_ids(value: str, key_name: str) -> set[int]:
+    """Разбирает список id через запятую («111, 222») в множество целых."""
+    result: set[int] = set()
+    for part in (value or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            result.add(int(part))
+        except ValueError:
+            raise BotConfigError(f"Параметр [BOT] {key_name} содержит некорректный id: {part!r}")
+    return result
 
 
 def _parse_int(value: str, key_name: str) -> int:
@@ -80,16 +95,16 @@ def load_bot_config(config_path: Path | str | None = None) -> BotConfig:
 
     # 2. ALLOWED_USER_IDS
     raw_allowed = bot_sec.get("ALLOWED_USER_IDS", "").strip() if "ALLOWED_USER_IDS" in bot_sec else ""
-    allowed_ids: set[int] = set()
-    if raw_allowed:
-        for part in raw_allowed.split(","):
-            part = part.strip()
-            if not part:
-                continue
-            try:
-                allowed_ids.add(int(part))
-            except ValueError:
-                raise BotConfigError(f"Параметр [BOT] ALLOWED_USER_IDS содержит некорректный id: {part!r}")
+    allowed_ids = _parse_ids(raw_allowed, "ALLOWED_USER_IDS")
+
+    # 2.1 ADMIN_IDS — администраторы, которые могут добавлять пользователей по id
+    raw_admins = bot_sec.get("ADMIN_IDS", "").strip() if "ADMIN_IDS" in bot_sec else ""
+    admin_ids = _parse_ids(raw_admins, "ADMIN_IDS")
+    if not admin_ids:
+        logger.warning(
+            "Параметр [BOT] ADMIN_IDS не задан: добавлять пользователей через бота будет некому. "
+            "Укажите хотя бы один id администратора."
+        )
 
     # 3. MAX_CONCURRENT_TASKS (любое значение трактуется как 1; >1 -> warning)
     raw_tasks = bot_sec.get("MAX_CONCURRENT_TASKS", "1") if "MAX_CONCURRENT_TASKS" in bot_sec else "1"
@@ -127,6 +142,7 @@ def load_bot_config(config_path: Path | str | None = None) -> BotConfig:
     return BotConfig(
         token=token,
         allowed_user_ids=allowed_ids,
+        admin_ids=admin_ids,
         max_concurrent_tasks=max_concurrent_tasks,
         progress_edit_interval=progress_edit_interval,
         donor_threshold=donor_threshold,

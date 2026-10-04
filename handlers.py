@@ -653,6 +653,16 @@ class EntityCache:
         return len(self._entities)
 
 
+def username_of(entity: Any) -> str:
+    """Telegram-username сущности (без `@`) или пустая строка."""
+    if entity is None:
+        return ""
+    username = getattr(entity, "username", None)
+    if not username:
+        return ""
+    return clean_cell_value(remove_invisible(str(username).lstrip("@")))
+
+
 def entity_display_name(entity: Any) -> str:
     """Имя для колонки `reactor_username`: username, иначе имя/название."""
     if entity is None:
@@ -812,6 +822,45 @@ def collect_message_peers(message: Any) -> list[Any]:
     return peers
 
 
+async def resolve_reactor_details(
+    client: TelegramClient, reactor: types.MessageReactor, cache: EntityCache,
+    throttle: Optional[RequestThrottle] = None,
+) -> tuple[str, Optional[int], str, str]:
+    """Определяет тип, id, имя и username отправителя звёзд.
+
+    Возвращает `(reactor_type, reactor_id, reactor_name, username)`.
+    `username` пуст, если у отправителя его нет (тогда в отчётах пишется
+    «отсутствует», см. `models.USERNAME_MISSING`).
+    """
+    peer = getattr(reactor, "peer_id", None)
+    if getattr(reactor, "anonymous", False) or peer is None:
+        return REACTOR_ANONYMOUS, None, "", ""
+
+    if isinstance(peer, types.PeerUser):
+        entity = await cache.resolve(client, peer, throttle=throttle)
+        if isinstance(entity, types.User):
+            if getattr(entity, "deleted", False):
+                return REACTOR_USER, peer.user_id, NOT_FOUND, ""
+            return (REACTOR_USER, entity.id, entity_display_name(entity),
+                    username_of(entity))
+        if entity is not None:  # на всякий случай: канал/чат
+            return (REACTOR_CHANNEL, getattr(entity, "id", peer.user_id),
+                    entity_display_name(entity), username_of(entity))
+        # Нет access_hash в кэше сессии — оставляем только id.
+        return REACTOR_USER, peer.user_id, NOT_FOUND, ""
+
+    if isinstance(peer, (types.PeerChannel, types.PeerChat)):
+        raw_id = getattr(peer, "channel_id", None) or getattr(peer, "chat_id", None)
+        entity = await cache.resolve(client, peer, throttle=throttle)
+        if entity is None:
+            return REACTOR_CHANNEL, raw_id, NOT_FOUND, ""
+        identifier = getattr(entity, "id", None) or raw_id
+        return REACTOR_CHANNEL, identifier, entity_display_name(entity), username_of(entity)
+
+    logger.warning("Неизвестный тип peer_id у реактора: %r", peer)
+    return REACTOR_UNKNOWN, None, "", ""
+
+
 async def resolve_reactor(
     client: TelegramClient, reactor: types.MessageReactor, cache: EntityCache,
     throttle: Optional[RequestThrottle] = None,
@@ -820,31 +869,10 @@ async def resolve_reactor(
 
     Возвращает `(reactor_type, reactor_id, reactor_username)`.
     """
-    peer = getattr(reactor, "peer_id", None)
-    if getattr(reactor, "anonymous", False) or peer is None:
-        return REACTOR_ANONYMOUS, None, ""
-
-    if isinstance(peer, types.PeerUser):
-        entity = await cache.resolve(client, peer, throttle=throttle)
-        if isinstance(entity, types.User):
-            if getattr(entity, "deleted", False):
-                return REACTOR_USER, peer.user_id, NOT_FOUND
-            return REACTOR_USER, entity.id, entity_display_name(entity)
-        if entity is not None:  # на всякий случай: канал/чат
-            return REACTOR_CHANNEL, getattr(entity, "id", peer.user_id), entity_display_name(entity)
-        # Нет access_hash в кэше сессии — оставляем только id.
-        return REACTOR_USER, peer.user_id, NOT_FOUND
-
-    if isinstance(peer, (types.PeerChannel, types.PeerChat)):
-        raw_id = getattr(peer, "channel_id", None) or getattr(peer, "chat_id", None)
-        entity = await cache.resolve(client, peer, throttle=throttle)
-        if entity is None:
-            return REACTOR_CHANNEL, raw_id, NOT_FOUND
-        identifier = getattr(entity, "id", None) or raw_id
-        return REACTOR_CHANNEL, identifier, entity_display_name(entity)
-
-    logger.warning("Неизвестный тип peer_id у реактора: %r", peer)
-    return REACTOR_UNKNOWN, None, ""
+    reactor_type, reactor_id, reactor_name, _username = await resolve_reactor_details(
+        client, reactor, cache, throttle=throttle
+    )
+    return reactor_type, reactor_id, reactor_name
 
 
 async def build_records_for_message(
@@ -901,12 +929,12 @@ async def build_records_for_message(
     records: list[StarRecord] = []
     for reactor in reactors:
         try:
-            reactor_type, reactor_id, reactor_name = await resolve_reactor(
+            reactor_type, reactor_id, reactor_name, username = await resolve_reactor_details(
                 client, reactor, cache, throttle=throttle
             )
         except Exception as exc:  # ошибка по одному реактору не роняет программу
             logger.exception("Ошибка обработки реактора в сообщении %s: %s", current_id, exc)
-            reactor_type, reactor_id, reactor_name = REACTOR_UNKNOWN, None, ""
+            reactor_type, reactor_id, reactor_name, username = REACTOR_UNKNOWN, None, "", ""
 
         records.append(
             StarRecord(
@@ -920,6 +948,7 @@ async def build_records_for_message(
                 reactor_username=reactor_name,
                 reactor_id=reactor_id,
                 stars_count=int(getattr(reactor, "count", 0) or 0),
+                reactor_has_username=bool(username),
             )
         )
     return records
@@ -963,6 +992,8 @@ async def iter_message_batches(
     batch_size = max(1, int(batch_size))
     buffer: list[Any] = []
     since_request = 0
+    # Дошли ли до лимита (`remaining == 0`) или история канала закончилась сама.
+    limit_reached = False
 
     # Нормализуем границы дат к UTC
     s_date = start_date
@@ -1013,6 +1044,10 @@ async def iter_message_batches(
                     if buffer:
                         yield buffer
                         buffer = []
+                    # Выходим за нижнюю границу периода: постов внутри выбранного
+                    # диапазона больше нет — их число известно точно.
+                    if stats is not None:
+                        stats.exhausted = True
                     return
 
                 # Если заданы конкретные выбранные годы, пропускаем сообщения вне объединения лет,
@@ -1030,9 +1065,14 @@ async def iter_message_batches(
                     yield buffer
                     buffer = []
                 if remaining <= 0:
+                    limit_reached = True
                     break
             if buffer:
                 yield buffer
+            if not limit_reached and stats is not None:
+                # История канала закончилась раньше запрошенного лимита:
+                # фактическое число постов известно, в отчёте не должно быть «из 1000000».
+                stats.exhausted = True
             return
         except FloodWaitError as exc:
             if buffer:
@@ -1263,6 +1303,7 @@ async def parse_channel(
     end_date: Optional[datetime] = None,
     progress_callback: Optional[Callable[[str, int, int, Optional[int], Optional[datetime]], Awaitable[None]]] = None,
     selected_years: Optional[set[int]] = None,
+    unlimited: bool = False,
 ) -> ParseStats:
     """Проходит по `limit` последним сообщениям канала и собирает записи о звёздах.
 
@@ -1272,6 +1313,10 @@ async def parse_channel(
     реальными запросами** к API, поэтому посты без звёзд и уже известные
     пользователи обрабатываются без ожидания вовсе.
 
+    `unlimited=True` — режим «все посты»: `limit` остаётся техническим ограничением
+    обхода, но в отчёт не попадает как план (иначе в сводке висело бы
+    «Обработано: 6957 из 1000000»).
+
     Записи добавляются в переданный список `records`, поэтому при прерывании
     (Ctrl+C) уже собранные данные можно сохранить. Если передан объект `stats`,
     он заполняется по ходу работы (удобно для частичного результата).
@@ -1280,9 +1325,8 @@ async def parse_channel(
     if throttle is None:
         throttle = RequestThrottle(delay, enabled=speed.per_request_delay)
     if stats is None:
-        stats = ParseStats(requested=int(limit))
-    else:
-        stats.requested = int(limit)
+        stats = ParseStats()
+    stats.set_requested(int(limit), unlimited=unlimited)
     if cache is None:
         cache = EntityCache(entity_batch=speed.entity_batch,
                             concurrency=speed.concurrency,
@@ -1347,6 +1391,7 @@ async def parse_channel(
         except Exception:
             pass
 
+    stats.finalize_requested()
     stats.elapsed = time.monotonic() - started
     stats.api_requests = max(0, throttle.requests - requests_before)
     stats.waited = max(0.0, throttle.slept - slept_before)
@@ -1371,5 +1416,6 @@ __all__ = [
     "local_input_peer", "message_type_with_forward", "parse_channel",
     "parse_channel_input", "parse_channels_input", "process_message_batch",
     "resolve_channel", "resolve_forward_source", "resolve_reactor",
-    "send_request", "split_channel_list", "warmup_participants",
+    "resolve_reactor_details", "send_request", "split_channel_list",
+    "username_of", "warmup_participants",
 ]

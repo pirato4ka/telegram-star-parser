@@ -455,7 +455,7 @@ def test_iter_message_batches_marks_exhausted():
 
 
 def test_cli_excel_username_rule():
-    """Лист Stars CLI: username при наличии, «отсутствует» при отсутствии."""
+    """Лист Stars CLI: «сырые» значения — username, имя, not_found, пусто у анонимов."""
     from exporter import build_dataframe
     from models import REACTOR_ANONYMOUS, REACTOR_USER, USERNAME_MISSING, StarRecord
 
@@ -467,7 +467,7 @@ def test_cli_excel_username_rule():
     ]
     frame = build_dataframe(records)
     usernames = list(frame["reactor_username"])
-    assert usernames == ["ivan", USERNAME_MISSING, USERNAME_MISSING]
+    assert usernames == ["ivan", "Ivan Petrov", ""]
     assert frame.loc[0, "post_link"] == ""
 
 

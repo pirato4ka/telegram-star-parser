@@ -298,7 +298,7 @@ python benchmark.py --count 10000 --latency 0.25
 | 2. Формат `message_type` для пересылок | `video(forward)` — суффикс `(forward)` | `models.FORWARD_SUFFIX` |
 | 3. `original_*` для непересланных постов | Дублируют `current_*` (канал и id поста) | в `handlers.build_records_for_message` — поставить `""`/`None` |
 | 4. Дополнительные поля | Добавлена только ссылка на пост в колонке `post_link`; дата и другие поля не добавлены | `models.py`, `handlers.py` |
-| 4.1. Что писать в `reactor_username` | username при наличии, иначе `отсутствует` (значение `models.USERNAME_MISSING`) | `models.py` (`StarRecord.username_for_report`) |
+| 4.1. Что писать в `reactor_username` | в Excel — «сырые» значения парсера (username / имя / `not_found` / пусто у анонимов, как в образце); в таблице чата — username или `отсутствует` (`models.USERNAME_MISSING`) | `exporter.py`, `models.py` (`StarRecord.username_for_report`) |
 | 5. Файл, если звёзд не найдено | **Не создаётся**, печатается «Звёзды не найдены» | `CREATE_EMPTY_FILE=true` в `[OUTPUT]` или `--create-empty-file` |
 | 6. Ссылка на пост | Добавлена колонка `post_link`; для публичных каналов используется `https://t.me/<username>/<id>`, для приватных — `https://t.me/c/<channel_id>/<id>` | формирование в `handlers.build_post_link` |
 
@@ -409,12 +409,16 @@ python -m bot.bot_main
 
 ### Результат в боте
 
-Excel-отчёт (лист «Донаты») — одна строка = один донат, поля как в согласованном
-образце: `message_type`, `reactor_type`, `current_channel`, `current_message_id`,
-`post_link`, `original_channel`, `original_message_id`, `reactor_username`,
-`reactor_id`, `stars_count`. В `reactor_username` пишется username донатера, а при
-его отсутствии — `отсутствует` (анонимные донаты тоже помечаются `отсутствует`);
-колонка `post_link` — кликабельная ссылка на пост.
+Excel-отчёт (лист «Донаты») — одна строка = один донат, поля и значения как в
+согласованном образце: `message_type`, `reactor_type`, `current_channel`,
+`current_message_id`, `post_link`, `original_channel`, `original_message_id`,
+`reactor_username`, `reactor_id`, `stars_count`. В `reactor_username` — то, что
+определил парсер: username, иначе имя/фамилия, при неудаче `not_found`, у
+анонимных донатов ячейка пустая; колонка `post_link` — кликабельная ссылка на пост.
+
+В **текстовой таблице чата** колонка `username` заполняется иначе (как на
+согласованном макете): username при наличии, при отсутствии — `отсутствует` — и
+рядом всегда виден id донатера. Лист «Сводка» следует тому же правилу, что и чат.
 
 В чат дополнительно отправляются топ донатеров таблицей и сводка по каналам.
 
@@ -425,7 +429,8 @@ Excel-отчёт (лист «Донаты») — одна строка = оди�
   известен: для «Все посты»/«По годам» число постов определяется по факту, для
   «Последние N» — по N. «Анонимов» считается по числу анонимных донатов, а не по
   постам.
-* В колонке `username` — username при наличии, иначе `отсутствует`.
+* В колонке `username` таблицы чата — username при наличии, иначе `отсутствует`
+  (в Excel — сырые значения парсера, как в образце).
 * Подсказка «id — без -100» из диалога убрана, строка «/help — эта справка» из
   приветствия удалена, приветствие — «👋 Бот для пробива донатеров звёзд в Telegram».
 

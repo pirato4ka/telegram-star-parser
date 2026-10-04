@@ -152,14 +152,10 @@ def unique_path(directory: Path, filename: str,
 def build_dataframe(records: Sequence[StarRecord]) -> pd.DataFrame:
     """Собирает DataFrame из записей (пустой — с правильными колонками).
 
-    В колонке `reactor_username` — username донатера, а при его отсутствии
-    «отсутствует» (`models.USERNAME_MISSING`).
+    Значения колонок — «сырые», как их определил парсер: в `reactor_username`
+    username, иначе имя, иначе `not_found` (у анонимных пусто).
     """
-    rows = []
-    for record in records:
-        row = record.to_row()
-        row[COLUMNS.index("reactor_username")] = record.username_for_report()
-        rows.append([clean_cell_value(value) for value in row])
+    rows = [[clean_cell_value(value) for value in record.to_row()] for record in records]
     frame = pd.DataFrame(rows, columns=list(COLUMNS), dtype=object)
     return frame
 
@@ -267,19 +263,19 @@ def export_records(
 def build_donation_rows(records: Sequence[StarRecord]) -> list[dict]:
     """Строки листа «Донаты»: каждый донат отдельно, со ссылкой на пост.
 
-    Состав и порядок полей — как на согласованном образце (скриншот 2):
+    Состав, порядок и значения полей — как на согласованном образце (скриншот 2):
     `message_type`, `reactor_type`, `current_channel`, `current_message_id`,
     `post_link`, `original_channel`, `original_message_id`, `reactor_username`,
     `reactor_id`, `stars_count`.
 
-    Отличие ровно одно: в `reactor_username` пишется username донатера, а если
-    его нет — «отсутствует» (вместо `not_found`/имени/пустой ячейки).
+    В `reactor_username` попадает то, что определил парсер: username, иначе имя
+    и фамилия, при неудаче — `not_found`, у анонимных — пусто. Вариант
+    «отсутствует» используется только в текстовой таблице чата.
     """
     rows: list[dict] = []
     for record in records:
         row = record.to_dict()
-        row["reactor_username"] = record.username_for_report()
-        rows.append(row)
+        rows.append({name: clean_cell_value(row[name]) for name in DONATION_COLUMNS})
     return rows
 
 
@@ -297,8 +293,8 @@ def export_donors_summary(
     * «Донаты» — каждая отправка звёзд отдельной строкой: поля 1:1 как на
       согласованном образце (`message_type`, `reactor_type`, `current_channel`,
       `current_message_id`, `post_link`, `original_channel`, `original_message_id`,
-      `reactor_username`, `reactor_id`, `stars_count`). В `reactor_username`
-      пишется username донатера, а если его нет — «отсутствует»;
+      `reactor_username`, `reactor_id`, `stars_count`). В `reactor_username` —
+      username, иначе имя, иначе `not_found` (у анонимных пусто), как в образце;
     * «Сводка» — агрегация по донатерам (кто сколько всего отправил);
     * «Инфо» — параметры парсинга и полнота результата.
 
@@ -310,7 +306,7 @@ def export_donors_summary(
     # 1. Лист «Донаты» — построчно, без суммирования
     donation_rows = build_donation_rows(records or [])
     df_donations = pd.DataFrame(
-        [[clean_cell_value(row[name]) for name in DONATION_COLUMNS] for row in donation_rows],
+        [[row[name] for name in DONATION_COLUMNS] for row in donation_rows],
         columns=list(DONATION_COLUMNS),
     )
     df_donations = df_donations.rename(columns=DONATION_HEADERS)

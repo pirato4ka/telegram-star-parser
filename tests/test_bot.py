@@ -163,6 +163,8 @@ def test_export_donors_summary():
                    "https://t.me/ch1/1", reactor_has_username=True),
         StarRecord("video(forward)", REACTOR_USER, "@ch1", 2, "src", 77, "Иван", 104, 5,
                    "https://t.me/ch1/2"),
+        StarRecord("text", REACTOR_USER, "@ch1", 4, "@ch1", 4, NOT_FOUND, 105, 1,
+                   "https://t.me/ch1/4"),
         StarRecord("text", REACTOR_ANONYMOUS, "@ch2", 3, "@ch2", 3, "", None, 30,
                    "https://t.me/ch2/3"),
     ]
@@ -190,15 +192,17 @@ def test_export_donors_summary():
         headers = [cell.value for cell in ws_donations[1]]
         assert headers == list(DONATION_COLUMNS)
         rows = list(ws_donations.iter_rows(values_only=True))[1:]
-        assert len(rows) == 3
+        assert len(rows) == 4
         idx = {name: position for position, name in enumerate(DONATION_COLUMNS)}
         assert rows[0][idx["current_channel"]] == "@ch1"
         assert rows[0][idx["stars_count"]] == 200
         assert rows[0][idx["post_link"]] == "https://t.me/ch1/1"
-        # username донатера есть — пишем как есть; нет — «отсутствует»
-        assert rows[0][idx["reactor_username"]] == "bob"
-        assert rows[1][idx["reactor_username"]] == USERNAME_MISSING
-        assert rows[2][idx["reactor_username"]] == USERNAME_MISSING
+        # Значения колонки username — как определил парсер (как в образце):
+        assert rows[0][idx["reactor_username"]] == "bob"        # username есть
+        assert rows[1][idx["reactor_username"]] == "Иван"       # username нет, есть имя
+        assert rows[2][idx["reactor_username"]] == NOT_FOUND    # расшифровать не удалось
+        # анонимный донат: ячейка пустая (pandas пишет пустую строку как None)
+        assert rows[3][idx["reactor_username"]] in (None, "")
         # ссылки кликабельны
         assert ws_donations.cell(row=2, column=idx["post_link"] + 1).hyperlink is not None
 
@@ -213,7 +217,7 @@ def test_export_donors_summary():
         summary_rows = {row[0]: row[1] for row in ws_summary.iter_rows(values_only=True) if row[0] is not None}
         assert summary_rows.get("Диапазон парсинга") == "Последние 100"
         assert summary_rows.get("Обработано постов") == "90 из 100"
-        assert summary_rows.get("Записей о донатах") == 3
+        assert summary_rows.get("Записей о донатах") == 4
         assert summary_rows.get("Результат неполный") == "Да"  # т.к. errors=1
 
 

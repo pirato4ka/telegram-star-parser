@@ -38,6 +38,7 @@ from handlers import (  # noqa: E402
     parse_channel,
     parse_channel_input,
     parse_channels_input,
+    resolve_channel,
     resolve_reactor,
     split_channel_list,
 )
@@ -336,6 +337,97 @@ class TestChannelsInput(unittest.TestCase):
         self.assertEqual(channel_input_text(-1001234567890), "-1001234567890")
         self.assertEqual(channel_input_text("https://t.me/+abcdefghijklmnopq"),
                          "https://t.me/+abcdefghijklmnopq")
+
+
+# --------------------------------------------------------------------------- #
+# resolve_channel: числовой id (в т.ч. без -100) и строковые raw-метаданные
+# --------------------------------------------------------------------------- #
+class _ResolveClient:
+    """Мини-клиент для resolve_channel: канал доступен по сыром и -100 id."""
+
+    CHANNEL_ID = 777
+    TITLE = "Resolved Chan"
+
+    def __init__(self, user_for_raw_id: bool = False, channel_exists: bool = True):
+        self.user_for_raw_id = user_for_raw_id
+        self.channel_exists = channel_exists
+        self.calls: list = []
+
+    @property
+    def marked_id(self) -> int:
+        return -(10 ** 12 + self.CHANNEL_ID)
+
+    async def get_entity(self, value):
+        self.calls.append(value)
+        if value == self.marked_id:
+            if not self.channel_exists:
+                raise ValueError(f"нет сущности {value!r}")
+            return make_channel(self.CHANNEL_ID, title=self.TITLE)
+        if value == self.CHANNEL_ID:
+            if self.user_for_raw_id:
+                return make_user(self.CHANNEL_ID)
+            return make_channel(self.CHANNEL_ID, title=self.TITLE)
+        raise ValueError(f"нет сущности {value!r}")
+
+
+class TestResolveChannel(unittest.TestCase):
+    """Разрешение каналов: bare-id без -100, строковый raw из метаданных задачи."""
+
+    def run_async(self, coro):
+        return asyncio.run(coro)
+
+    def test_bare_int_id_tries_marked_first(self):
+        client = _ResolveClient()
+        entity = self.run_async(resolve_channel(client, _ResolveClient.CHANNEL_ID))
+        self.assertEqual(channel_title(entity), _ResolveClient.TITLE)
+        self.assertEqual(client.calls, [client.marked_id])
+
+    def test_string_bare_id_from_meta(self):
+        # Бот повторно разрешает каналы из строковых raw-метаданных задачи.
+        client = _ResolveClient()
+        entity = self.run_async(resolve_channel(client, "777"))
+        self.assertEqual(channel_title(entity), _ResolveClient.TITLE)
+        self.assertEqual(client.calls, [client.marked_id])
+
+    def test_string_marked_id_from_meta(self):
+        client = _ResolveClient()
+        entity = self.run_async(resolve_channel(client, "-1000000000777"))
+        self.assertEqual(channel_title(entity), _ResolveClient.TITLE)
+        self.assertEqual(client.calls, [client.marked_id])
+
+    def test_marked_int_id(self):
+        client = _ResolveClient()
+        entity = self.run_async(resolve_channel(client, -1000000000777))
+        self.assertEqual(channel_title(entity), _ResolveClient.TITLE)
+        self.assertEqual(client.calls, [client.marked_id])
+
+    def test_numeric_string_with_spaces(self):
+        client = _ResolveClient()
+        entity = self.run_async(resolve_channel(client, "  777  "))
+        self.assertEqual(channel_title(entity), _ResolveClient.TITLE)
+
+    def test_user_collision_falls_back_to_marked_id(self):
+        # Сырой id совпал с id пользователя — канал всё равно должен найтись.
+        client = _ResolveClient(user_for_raw_id=True)
+        entity = self.run_async(resolve_channel(client, _ResolveClient.CHANNEL_ID))
+        self.assertEqual(channel_title(entity), _ResolveClient.TITLE)
+
+    def test_only_user_raises(self):
+        client = _ResolveClient(user_for_raw_id=True, channel_exists=False)
+        with self.assertRaises(ChannelResolutionError) as ctx:
+            self.run_async(resolve_channel(client, _ResolveClient.CHANNEL_ID))
+        self.assertIn("пользователь", str(ctx.exception))
+
+    def test_username_string_passed_through_untouched(self):
+        client = _ResolveClient()
+        with self.assertRaises(ChannelResolutionError):
+            self.run_async(resolve_channel(client, "definitely_missing"))
+        self.assertEqual(client.calls, ["definitely_missing"])
+
+    def test_not_found_raises(self):
+        client = _ResolveClient()
+        with self.assertRaises(ChannelResolutionError):
+            self.run_async(resolve_channel(client, 999999999))
 
 
 # --------------------------------------------------------------------------- #

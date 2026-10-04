@@ -202,7 +202,7 @@ async def cmd_warmup(
 ) -> None:
     args = message.text.partition(" ")[2].strip()
     if not args:
-        await message.answer("Использование: /warmup &lt;канал&gt;")
+        await message.answer("Использование: /warmup &lt;канал&gt;", parse_mode="HTML")
         return
 
     user_id = message.from_user.id
@@ -234,16 +234,29 @@ async def _run_warmup_task(
     client: TelegramClient,
     channel_str: str,
 ) -> None:
-    status_msg = await bot.send_message(chat_id, f"Начинаем прогрев кэша для {html.escape(channel_str)}...")
+    task.current_channel = channel_str
+    status_msg = await bot.send_message(
+        chat_id,
+        f"Начинаем прогрев кэша для {html.escape(channel_str)}...",
+        parse_mode="HTML",
+    )
     try:
-        resolved, title = await resolve_channel(client, channel_str)
+        resolved = await resolve_channel(client, channel_str)
+        title = channel_title(resolved)
         count = await warmup_participants(client, resolved)
-        await status_msg.edit_text(f"✅ Прогрев кэша для <b>{html.escape(title)}</b> завершён. Закэшировано: {count} участников.", parse_mode="HTML")
+        await status_msg.edit_text(
+            f"✅ Прогрев кэша для <b>{html.escape(title)}</b> завершён. "
+            f"Закэшировано: {count} участников.",
+            parse_mode="HTML",
+        )
     except asyncio.CancelledError:
         await status_msg.edit_text("🛑 Прогрев кэша отменён.")
         raise
     except Exception as exc:
-        await status_msg.edit_text(f"❌ Ошибка прогрева кэша: {html.escape(str(exc))}")
+        await status_msg.edit_text(
+            f"❌ Ошибка прогрева кэша: {html.escape(str(exc))}",
+            parse_mode="HTML",
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -285,7 +298,7 @@ async def cmd_parse(
         await message.answer(
             "📋 <b>Шаг 1: Каналы</b>\n\n"
             "Пришлите список каналов для парсинга (через запятую, точку с запятой или с новой строки):\n"
-            "<i>Пример: @channel1, t.me/channel2, -1001234567890</i>",
+            "<i>Пример: @channel1, t.me/channel2, 1234567890 (id — без -100)</i>",
             parse_mode="HTML",
         )
 
@@ -337,7 +350,8 @@ async def _handle_channels_input(
     for item in channels_raw:
         item_str = str(item)
         try:
-            entity, title = await resolve_channel(telethon_client, item)
+            entity = await resolve_channel(telethon_client, item)
+            title = channel_title(entity)
             last_id = await get_last_message_id(telethon_client, entity)
             resolved_channels.append({
                 "raw": item_str,
@@ -345,7 +359,8 @@ async def _handle_channels_input(
                 "found": True,
                 "last_id": last_id,
             })
-        except Exception:
+        except Exception as exc:
+            logger.warning("Не удалось разрешить канал %r: %s", item, exc)
             resolved_channels.append({
                 "raw": item_str,
                 "title": item_str,
@@ -729,6 +744,18 @@ async def _run_parsing_task(
 
     interrupted = False
 
+    # Сообщаем, что задача реально взята в работу: иначе сообщение может
+    # оставаться «в очереди», пока не наберётся первая пачка просмотренных постов.
+    try:
+        await bot.edit_message_text(
+            "🔄 <b>Парсинг запущен.</b>\n<i>Для отмены используйте /cancel</i>",
+            chat_id=chat_id,
+            message_id=status_msg_id,
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
+
     for ch_item in channels_raw:
         if task.cancelled_by_user:
             interrupted = True
@@ -737,7 +764,8 @@ async def _run_parsing_task(
 
         task.current_channel = str(ch_item)
         try:
-            entity, title = await resolve_channel(client, ch_item)
+            entity = await resolve_channel(client, ch_item)
+            title = channel_title(entity)
         except Exception as exc:
             logger.error("Не удалось разрешить канал %s: %s", ch_item, exc)
             channel_outcomes[str(ch_item)] = f"ошибка: {exc}"

@@ -4,7 +4,7 @@
 Запуск:
     python main.py
     python main.py --channel @durov --count 200
-    python main.py --channel "@durov, t.me/telegram, -1001234567890" -n 500
+    python main.py --channel "@durov, t.me/telegram, 1234567890" -n 500
 
 Несколько каналов перечисляются через запятую: они становятся в очередь и
 обрабатываются по очереди, для каждого сохраняется свой Excel-файл.
@@ -74,7 +74,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("-c", "--config", type=Path, default=None,
                         help="путь к conf.ini (по умолчанию — рядом с приложением)")
     parser.add_argument("--channel", default=None,
-                        help="канал: @username, ссылка t.me/..., числовой id (-100...); "
+                        help="канал: @username, ссылка t.me/... или числовой id "
+                             "(1234567890 — без -100, либо -1001234567890); "
                              "несколько каналов — через запятую (обрабатываются по очереди)")
     parser.add_argument("-n", "--count", type=int, default=None,
                         help="сколько последних постов анализировать (для каждого канала)")
@@ -140,7 +141,7 @@ async def prompt_channels(client: TelegramClient,
         raw = preset if preset is not None else input(PROMPT_CHANNEL).strip()
         preset = None
         if not raw:
-            print("Пустой ввод. Пример: @durov, t.me/telegram или -1001234567890")
+            print("Пустой ввод. Пример: @durov, t.me/telegram или 1234567890 (id без -100)")
             continue
 
         try:

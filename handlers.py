@@ -212,17 +212,33 @@ def channel_input_text(value: Union[str, int]) -> str:
 
 
 async def resolve_channel(client: TelegramClient, value: Union[str, int]) -> Any:
-    """Возвращает сущность канала, пробуя несколько интерпретаций числового id."""
+    """Возвращает сущность канала, пробуя несколько интерпретаций числового id.
+
+    Числовой id можно вводить и без префикса `-100` (`1234567890`), и с ним
+    (`-1001234567890`). Строковый ввод, состоящий только из цифр (например,
+    `"1234567890"` из сохранённых метаданных задачи), приводится к int — иначе
+    `get_entity` воспримет его как username/телефон и канал не найдётся.
+    """
+    # Нормализация: разбор ввода возвращает int, а бот повторно разрешает
+    # каналы из строковых `raw`-метаданных — приводим цифры к int.
+    if isinstance(value, str):
+        text = value.strip()
+        if re.fullmatch(r"-?\d+", text):
+            value = int(text)
+
     candidates: list[Union[str, int]] = [value]
 
     if isinstance(value, int):
-        # Положительный id обычно означает «сырой» id канала -> пробуем -100<id>.
+        # Положительный id обычно означает «сырой» id канала/группы ->
+        # сначала пробуем -100<id>, затем «сырой» id (закэшированный канал
+        # находится сессией и по нестрогому поиску).
         if value > 0:
-            candidates.append(utils.get_peer_id(types.PeerChannel(value)))
+            candidates = [utils.get_peer_id(types.PeerChannel(value)), value]
         elif not str(value).startswith("-100"):
-            candidates.append(utils.get_peer_id(types.PeerChannel(abs(value))))
+            candidates = [value, utils.get_peer_id(types.PeerChannel(abs(value)))]
 
     last_error: Optional[BaseException] = None
+    user_entity: Any = None
     for candidate in candidates:
         try:
             entity = await client.get_entity(candidate)
@@ -234,11 +250,16 @@ async def resolve_channel(client: TelegramClient, value: Union[str, int]) -> Any
             last_error = ChannelResolutionError(f"Сущность {candidate!r} не найдена.")
             continue
         if isinstance(entity, types.User):
-            raise ChannelResolutionError(
-                f"{value!r} — это пользователь, а не канал. Укажите канал/чат."
-            )
+            # id мог совпасть с id пользователя — сначала пробуем остальные
+            # интерпретации (например -100<id>), и только потом сообщаем об ошибке.
+            user_entity = entity
+            continue
         return entity
 
+    if user_entity is not None:
+        raise ChannelResolutionError(
+            f"{value!r} — это пользователь, а не канал. Укажите канал/чат."
+        )
     raise ChannelResolutionError(f"Канал {value!r} не найден или недоступен: {last_error}")
 
 

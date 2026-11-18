@@ -90,7 +90,7 @@ class AdminState(StatesGroup):
 
 
 class DonorSearchState(StatesGroup):
-    """Ожидание id/username для поиска донора по сохранённым отчётам."""
+    """Ожидание id/username для поиска донатера по сохранённым отчётам."""
 
     QUERY = State()
 
@@ -140,7 +140,7 @@ def _main_keyboard(admin: bool) -> InlineKeyboardMarkup:
     """Клавиатура главного меню."""
     rows = [
         [InlineKeyboardButton(text="🚀 Запустить парсинг", callback_data="wiz:start")],
-        [InlineKeyboardButton(text="🔎 Найти донора", callback_data="donor:search")],
+        [InlineKeyboardButton(text="🔎 Найти донатера", callback_data="donor:search")],
         [
             InlineKeyboardButton(text="📈 Моя задача", callback_data="wiz:status"),
             InlineKeyboardButton(text="🕒 Очередь", callback_data="wiz:queue"),
@@ -175,7 +175,7 @@ def _help_text(admin: bool = False) -> str:
         "",
         "<b>Команды</b>",
         "• /parse [каналы] — запустить парсинг",
-        "• /donor [id|@username] — найти донора в сохранённых отчётах",
+        "• /donor [id|@username] — найти донатера в сохранённых отчётах",
         "• /status — прогресс вашей задачи",
         "• /queue — очередь задач",
         "• /cancel — отменить диалог или задачу",
@@ -207,7 +207,7 @@ async def cmd_start(message: Message, state: FSMContext, bot_config: BotConfig) 
         "Excel: <b>каждый донат отдельной строкой</b> — канал, ссылка на пост, "
         "username, id и количество звёзд.\n\n"
         "Нажмите «🚀 Запустить парсинг» или пришлите /parse.\n\n"
-        "Уже собранные отчёты можно искать по донору: «🔎 Найти донора» или /donor."
+        "Уже собранные отчёты можно искать по донатеру: «🔎 Найти донатера» или /donor."
     )
     await message.answer(text, parse_mode="HTML", reply_markup=_main_keyboard(admin))
 
@@ -235,14 +235,13 @@ async def cb_help(callback: CallbackQuery, bot_config: BotConfig) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Поиск донора по сохранённым Excel-отчётам
+# Поиск донатера по сохранённым Excel-отчётам
 # --------------------------------------------------------------------------- #
 DONOR_SEARCH_STEP_TEXT = (
-    "🔎 <b>Поиск донора</b>\n\n"
-    "Пришлите <b>id</b> или <b>@username</b> донора — поищу его во всех сохранённых "
+    "🔎 <b>Поиск донатера</b>\n\n"
+    "Пришлите <b>id</b> или <b>@username</b> донатера — поищу его во всех сохранённых "
     "Excel-отчётах и соберу отдельный файл с разбивкой по каналам.\n\n"
-    "Примеры: <code>123456789</code>, <code>@username</code>.\n"
-    "<i>Отмена — кнопка ниже.</i>"
+    "Примеры: <code>123456789</code>, <code>@username</code>."
 )
 
 MAX_SENT_FILE_SIZE = 50 * 1024 * 1024  # 50 MB — лимит Telegram для документов
@@ -250,7 +249,7 @@ MAX_SENT_FILE_SIZE = 50 * 1024 * 1024  # 50 MB — лимит Telegram для д
 
 @router.message(Command("donor"))
 async def cmd_donor(message: Message, state: FSMContext, bot_config: BotConfig) -> None:
-    """`/donor [id|@username]`: поиск донора по уже сохранённым отчётам."""
+    """`/donor [id|@username]`: поиск донатера по уже сохранённым отчётам."""
     raw_query = (message.text or "").partition(" ")[2].strip()
     if raw_query:
         await _run_donor_search(message, raw_query, bot_config)
@@ -266,7 +265,7 @@ async def cmd_donor(message: Message, state: FSMContext, bot_config: BotConfig) 
 async def cb_donor_search(
     callback: CallbackQuery, state: FSMContext, bot_config: BotConfig
 ) -> None:
-    """Кнопка «🔎 Найти донора» в главном меню."""
+    """Кнопка «🔎 Найти донатера» в главном меню."""
     _cancel_user_idle_timer(callback.from_user.id)
     await state.clear()
     await state.set_state(DonorSearchState.QUERY)
@@ -282,20 +281,20 @@ async def cb_donor_search(
 
 
 async def _run_donor_search(message: Message, raw_query: str, bot_config: BotConfig) -> None:
-    """Ищет донора по всем .xlsx в `output/` и присылает `<...>_парсинг.xlsx`."""
+    """Ищет донатера по всем .xlsx в `output/` и присылает `<...>_парсинг.xlsx`."""
     try:
         parse_donor_query(raw_query)
     except ValueError as exc:
         await message.answer(f"⚠️ {html.escape(str(exc))}", parse_mode="HTML")
         return
 
-    status = await message.answer("🔎 Ищу донора в сохранённых Excel-отчётах…")
+    status = await message.answer("🔎 Ищу донатера в сохранённых Excel-отчётах…")
     out_dir = Path("output")
 
     try:
         result = await asyncio.to_thread(search_donor, raw_query, out_dir)
     except Exception as exc:  # noqa: BLE001 - пользователю нужен понятный ответ
-        logger.exception("Ошибка поиска донора: %s", exc)
+        logger.exception("Ошибка поиска донатера: %s", exc)
         await status.edit_text("❌ Не удалось выполнить поиск. Подробности — в логах.")
         return
 
@@ -307,7 +306,7 @@ async def _run_donor_search(message: Message, raw_query: str, bot_config: BotCon
     try:
         report_path = await asyncio.to_thread(build_donor_report, result, out_dir)
     except Exception as exc:  # noqa: BLE001
-        logger.exception("Ошибка формирования отчёта по донору: %s", exc)
+        logger.exception("Ошибка формирования отчёта по донатеру: %s", exc)
         report_path = None
 
     await status.edit_text(summary, parse_mode="HTML")
@@ -319,7 +318,7 @@ async def _run_donor_search(message: Message, raw_query: str, bot_config: BotCon
     if bot_config.send_files and 0 < file_size <= MAX_SENT_FILE_SIZE:
         await message.answer_document(
             FSInputFile(str(report_path)),
-            caption=f"📄 Отчёт по донору: {html.escape(result.report_name)}",
+            caption=f"📄 Отчёт по донатеру: {html.escape(result.report_name)}",
         )
     else:
         reason = ("размер превышает 50 МБ" if file_size > MAX_SENT_FILE_SIZE
@@ -1621,11 +1620,11 @@ async def _send_final_results(
 
 
 # --------------------------------------------------------------------------- #
-# Ввод id/username для поиска донора (регистрируется последним)
+# Ввод id/username для поиска донатера (регистрируется последним)
 # --------------------------------------------------------------------------- #
 @router.message(DonorSearchState.QUERY)
 async def process_donor_query(message: Message, state: FSMContext, bot_config: BotConfig) -> None:
-    """Принимает id/username после кнопки «🔎 Найти донора» или `/donor`.
+    """Принимает id/username после кнопки «🔎 Найти донатера» или `/donor`.
 
     Хендлер ловит любой текст, поэтому регистрируется в самом конце модуля:
     иначе он перехватывал бы команды (/status, /parse, /admin и т.д.).

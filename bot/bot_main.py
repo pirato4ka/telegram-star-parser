@@ -99,7 +99,7 @@ async def main() -> None:
             [
                 BotCommand(command="start", description="Главное меню"),
                 BotCommand(command="parse", description="Запустить парсинг каналов"),
-                BotCommand(command="donor", description="Найти донора по id или username"),
+                BotCommand(command="donor", description="Найти донатера по id или username"),
                 BotCommand(command="status", description="Прогресс моей задачи"),
                 BotCommand(command="queue", description="Очередь задач"),
                 BotCommand(command="cancel", description="Отменить диалог или задачу"),

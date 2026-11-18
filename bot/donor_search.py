@@ -1,4 +1,4 @@
-"""Поиск донора по id / username по всем Excel-отчётам в каталоге `output/`.
+"""Поиск донатера по id / username по всем Excel-отчётам в каталоге `output/`.
 
 Модуль рассчитан на то, что отчётов много и они большие, поэтому:
 
@@ -135,7 +135,7 @@ class DonorRow:
 
 @dataclass(slots=True)
 class ChannelStat:
-    """Сводка по одному каналу для найденного донора."""
+    """Сводка по одному каналу для найденного донатера."""
 
     channel: str
     donations: int = 0
@@ -149,7 +149,7 @@ class ChannelStat:
 
 @dataclass(slots=True)
 class DonorSearchResult:
-    """Результат поиска донора по всем отчётам."""
+    """Результат поиска донатера по всем отчётам."""
 
     query: str
     query_kind: str  # "id" | "username"
@@ -190,14 +190,14 @@ def parse_donor_query(raw: str) -> tuple[str, Any]:
     """
     text = (raw or "").strip()
     if not text:
-        raise ValueError("Пустой запрос: пришлите id или @username донора.")
+        raise ValueError("Пустой запрос: пришлите id или @username донатера.")
 
     if "t.me/" in text.lower():
         text = text.rstrip("/").rsplit("/", 1)[-1]
 
     text = text.strip().lstrip("@").strip()
     if not text:
-        raise ValueError("Пустой запрос: пришлите id или @username донора.")
+        raise ValueError("Пустой запрос: пришлите id или @username донатера.")
 
     lowered = text.lower()
     if lowered.startswith("id") and text[2:].strip().isdigit():
@@ -282,7 +282,7 @@ def channel_from_link(link: str) -> str:
 
 
 def _build_hit(raw: tuple, mapping: dict[str, int], source: str) -> Optional[DonorRow]:
-    """Превращает строку листа в DonorRow (или None, если донора в ней нет)."""
+    """Превращает строку листа в DonorRow (или None, если донатера в ней нет)."""
     def value(field_name: str) -> Any:
         index = mapping.get(field_name)
         if index is None or index >= len(raw):
@@ -349,7 +349,7 @@ def _extract_sheet_rows(sheet) -> tuple[dict[str, int], list[tuple]]:
 
 
 def _scan_workbook(path: Path) -> list[DonorRow]:
-    """Читает один .xlsx и возвращает строки доноров из самого точного листа.
+    """Читает один .xlsx и возвращает строки донатеров из самого точного листа.
 
     Дубли не считаются дважды: если в файле есть лист «Донаты», лист «Сводка»
     того же файла игнорируется (там те же донаты, но уже просуммированные).
@@ -535,7 +535,7 @@ def _aggregate_channels(rows: Iterable[DonorRow]) -> list[ChannelStat]:
 
 
 def search_donor(query: str, output_dir: Path | str = Path("output")) -> DonorSearchResult:
-    """Ищет донора по id или username во всех сохранённых отчётах.
+    """Ищет донатера по id или username во всех сохранённых отчётах.
 
     Первый вызов индексирует все .xlsx, последующие — только новые/изменённые
     файлы, а сам поиск идёт по SQLite-индексу (без чтения Excel).
@@ -662,7 +662,7 @@ def build_donor_report(result: DonorSearchResult,
         _style_sheet(writer.sheets[INFO_SHEET_NAME], info_frame)
 
     logger.info(
-        "Отчёт по донору сохранён: %s (строк: %d, каналов: %d)",
+        "Отчёт по донатеру сохранён: %s (строк: %d, каналов: %d)",
         path, result.total_rows, len(result.channels),
     )
     return path
@@ -677,12 +677,12 @@ def format_search_summary(result: DonorSearchResult) -> str:
     query = html.escape(result.query)
     if not result.rows:
         return (
-            f"🔎 Донор <code>{query}</code> не найден в сохранённых отчётах.\n"
+            f"🔎 Донатер <code>{query}</code> не найден в сохранённых отчётах.\n"
             f"<i>Проверено файлов: {result.files_scanned}</i>"
         )
 
     lines = [
-        "🔎 <b>Донор найден</b>",
+        "🔎 <b>Донатер найден</b>",
         f"Запрос: <code>{query}</code>",
         f"Строк: <b>{result.total_rows}</b> · звёзд: <b>{result.total_stars}</b> · "
         f"каналов: <b>{len(result.channels)}</b> · файлов: <b>{result.files_with_hits}</b>",

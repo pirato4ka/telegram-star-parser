@@ -1,4 +1,4 @@
-"""Тесты поиска донора по сохранённым Excel-отчётам (bot.donor_search)."""
+"""Тесты поиска донатера по сохранённым Excel-отчётам (bot.donor_search)."""
 
 import asyncio
 import sys
@@ -207,7 +207,7 @@ def test_handler_sends_report(output_dir: Path, monkeypatch):
     asyncio.run(_run_donor_search(message, "@alice", BotConfig(token="test")))
 
     assert message.status is not None
-    assert "Донор найден" in message.status.texts[-1]
+    assert "Донатер найден" in message.status.texts[-1]
     assert len(message.documents) == 1
     assert Path(message.documents[0].path).name == "alice_парсинг.xlsx"
 
@@ -240,7 +240,7 @@ def test_summary_escapes_html():
     text = format_search_summary(result)
     assert "a&lt;&amp;" in text
     assert "Канал &amp; &lt;b&gt;" in text
-    assert "<b>Донор найден</b>" in text
+    assert "<b>Донатер найден</b>" in text
 
 
 def test_handler_reports_invalid_query(output_dir: Path, monkeypatch):

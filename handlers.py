@@ -1336,7 +1336,7 @@ async def parse_channel(
 
     channel_name = channel_title(entity)
     chunk = int(batch_size or speed.batch_size_for(limit))
-    started = time.monotonic()
+    started = time.perf_counter()
     # Один троттлинг может обслуживать очередь из нескольких каналов, поэтому
     # в статистику прохода берутся только запросы/ожидания этого прохода.
     requests_before = throttle.requests
@@ -1392,7 +1392,9 @@ async def parse_channel(
             pass
 
     stats.finalize_requested()
-    stats.elapsed = time.monotonic() - started
+    # perf_counter — высокое разрешение и монотонность: на Windows monotonic()
+    # может «округлиться» до нуля на быстром однокомандном парсинге.
+    stats.elapsed = time.perf_counter() - started
     stats.api_requests = max(0, throttle.requests - requests_before)
     stats.waited = max(0.0, throttle.slept - slept_before)
 

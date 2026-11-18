@@ -472,27 +472,32 @@ def test_cli_excel_username_rule():
 
 
 def test_bot_build_donation_rows_fields():
-    """Лист «Донаты»: состав и порядок полей 1:1 как на согласованном образце."""
-    from exporter import DONATION_COLUMNS, build_donation_rows
-    from models import COLUMNS
+    """Лист «Донаты»: 6 согласованных полей; строки без reactor_id отбрасываются."""
+    from exporter import DONATION_COLUMNS, build_donation_rows, is_resolvable_reactor
+    from models import REACTOR_ANONYMOUS, REACTOR_USER, StarRecord
 
-    assert DONATION_COLUMNS == COLUMNS
     assert list(DONATION_COLUMNS) == [
-        "message_type", "reactor_type", "current_channel", "current_message_id",
-        "post_link", "original_channel", "original_message_id", "reactor_username",
-        "reactor_id", "stars_count",
+        "reactor_id", "reactor_username", "stars_count",
+        "post_link", "reactor_type", "original_message_id",
     ]
 
-    from models import REACTOR_USER, StarRecord
+    with_id = StarRecord("photo", REACTOR_USER, "Канал", 100, "Канал", 100, "vasya", 5, 3,
+                         "https://t.me/kanal/100", reactor_has_username=True)
+    anonymous = StarRecord("text", REACTOR_ANONYMOUS, "Канал", 101, "Канал", 101, "", None, 7)
+    without_id = StarRecord("text", REACTOR_USER, "Канал", 102, "Канал", 102, "petya", None, 4)
 
-    rows = build_donation_rows([
-        StarRecord("photo", REACTOR_USER, "Канал", 100, "Канал", 100, "vasya", 5, 3,
-                   "https://t.me/kanal/100", reactor_has_username=True),
-    ])
-    assert rows[0]["message_type"] == "photo"
-    assert rows[0]["post_link"] == "https://t.me/kanal/100"
+    assert is_resolvable_reactor(with_id)
+    assert not is_resolvable_reactor(anonymous)
+    assert not is_resolvable_reactor(without_id)
+
+    rows = build_donation_rows([with_id, anonymous, without_id])
+    assert len(rows) == 1
+    assert rows[0]["reactor_id"] == 5
     assert rows[0]["reactor_username"] == "vasya"
     assert rows[0]["stars_count"] == 3
+    assert rows[0]["post_link"] == "https://t.me/kanal/100"
+    assert rows[0]["reactor_type"] == REACTOR_USER
+    assert rows[0]["original_message_id"] == 100
 
 
 # --------------------------------------------------------------------------- #

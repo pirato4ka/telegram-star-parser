@@ -16,6 +16,7 @@ from models import (
     COLUMNS,
     EXCEL_SHEET_NAME,
     ParseStats,
+    REACTOR_ANONYMOUS,
     StarRecord,
     USERNAME_MISSING,
 )
@@ -32,9 +33,16 @@ if TYPE_CHECKING:
     from bot.aggregate import DonorAggregate
 
 # --- Лист «Донаты»: одна строка = один донат (пост + отправитель + звёзды) ---- #
-# Поля 1:1 как на согласованном образце (скриншот 2): каждый донат отдельной
-# строкой, со ссылкой на пост и количеством звёзд.
-DONATION_COLUMNS = COLUMNS
+# Состав и порядок колонок отчёта бота: только то, что нужно для пробива
+# донатера, — кто (id + username), сколько звёзд, куда (пост) и тип отправителя.
+DONATION_COLUMNS = (
+    "reactor_id",
+    "reactor_username",
+    "stars_count",
+    "post_link",
+    "reactor_type",
+    "original_message_id",
+)
 
 DONATION_HEADERS = {name: name for name in DONATION_COLUMNS}
 
@@ -260,20 +268,33 @@ def export_records(
     return None
 
 
+def is_resolvable_reactor(record: StarRecord) -> bool:
+    """Можно ли пробить отправителя: известен ли его `reactor_id`.
+
+    Анонимные донаты и записи, где id получить не удалось, в отчёт не попадают —
+    по ним нельзя найти донатера, а только искажают суммы и статистику.
+    """
+    return record.reactor_id is not None and int(record.reactor_id) > 0
+
+
 def build_donation_rows(records: Sequence[StarRecord]) -> list[dict]:
     """Строки листа «Донаты»: каждый донат отдельно, со ссылкой на пост.
 
-    Состав, порядок и значения полей — как на согласованном образце (скриншот 2):
-    `message_type`, `reactor_type`, `current_channel`, `current_message_id`,
-    `post_link`, `original_channel`, `original_message_id`, `reactor_username`,
-    `reactor_id`, `stars_count`.
+    Колонки и их порядок — `DONATION_COLUMNS`: `reactor_id`, `reactor_username`,
+    `stars_count`, `post_link`, `reactor_type`, `original_message_id`.
+
+    Строки без разрешимого `reactor_id` (анонимные донаты и записи, где id
+    отправителя получить не удалось) отбрасываются: такого донатера нельзя
+    найти, а его звёзды искажают статистику.
 
     В `reactor_username` попадает то, что определил парсер: username, иначе имя
-    и фамилия, при неудаче — `not_found`, у анонимных — пусто. Вариант
-    «отсутствует» используется только в текстовой таблице чата.
+    и фамилия, при неудаче — `not_found`. Вариант «отсутствует» используется
+    только в текстовой таблице чата.
     """
     rows: list[dict] = []
     for record in records:
+        if not is_resolvable_reactor(record):
+            continue
         row = record.to_dict()
         rows.append({name: clean_cell_value(row[name]) for name in DONATION_COLUMNS})
     return rows
@@ -290,11 +311,12 @@ def export_donors_summary(
     """Формирует Excel-отчёт бота.
 
     Листы:
-    * «Донаты» — каждая отправка звёзд отдельной строкой: поля 1:1 как на
-      согласованном образце (`message_type`, `reactor_type`, `current_channel`,
-      `current_message_id`, `post_link`, `original_channel`, `original_message_id`,
-      `reactor_username`, `reactor_id`, `stars_count`). В `reactor_username` —
-      username, иначе имя, иначе `not_found` (у анонимных пусто), как в образце;
+    * «Донаты» — каждая отправка звёзд отдельной строкой, колонки и порядок —
+      `DONATION_COLUMNS` (`reactor_id`, `reactor_username`, `stars_count`,
+      `post_link`, `reactor_type`, `original_message_id`). В `reactor_username` —
+      username, иначе имя, иначе `not_found`. Строки, у которых не удалось
+      определить `reactor_id` (анонимные донаты и нерасшифрованные отправители),
+      в отчёт не попадают;
     * «Сводка» — агрегация по донатерам (кто сколько всего отправил);
     * «Инфо» — параметры парсинга и полнота результата.
 
@@ -304,16 +326,18 @@ def export_donors_summary(
     path.parent.mkdir(parents=True, exist_ok=True)
 
     # 1. Лист «Донаты» — построчно, без суммирования
-    donation_rows = build_donation_rows(records or [])
+    all_records = list(records or [])
+    donation_rows = build_donation_rows(all_records)
     df_donations = pd.DataFrame(
         [[row[name] for name in DONATION_COLUMNS] for row in donation_rows],
         columns=list(DONATION_COLUMNS),
     )
     df_donations = df_donations.rename(columns=DONATION_HEADERS)
 
-    # 2. Лист «Сводка» — агрегация по донатерам
+    # 2. Лист «Сводка» — агрегация по донатерам (только с известным id)
+    kept_donors = [d for d in donors if d.reactor_id is not None]
     donor_rows = []
-    for d in donors:
+    for d in kept_donors:
         channels_str = ", ".join(d.channels) if isinstance(d.channels, (list, set, tuple)) else str(d.channels or "")
         donor_rows.append({
             "rank": d.rank,
@@ -335,9 +359,10 @@ def export_donors_summary(
     total_errors = sum(s.errors for s in stats_by_channel.values()) if stats_by_channel else 0
     total_unparsed = sum(s.unparsed for s in stats_by_channel.values()) if stats_by_channel else 0
     total_not_found = sum(s.not_found for s in stats_by_channel.values()) if stats_by_channel else 0
-    total_anon = sum(1 for d in donors if d.reactor_type == "anonymous")
-    total_stars = sum(d.stars_total for d in donors)
+    total_anon = sum(1 for record in all_records if record.reactor_type == REACTOR_ANONYMOUS)
+    total_stars = sum(int(row["stars_count"] or 0) for row in donation_rows)
     total_donations = len(donation_rows)
+    skipped_no_id = len(all_records) - total_donations
 
     is_incomplete = (total_errors + total_unparsed) > 0 or any(s.interrupted for s in stats_by_channel.values())
 
@@ -359,6 +384,7 @@ def export_donors_summary(
         {"Параметр": "Ошибок и непрочитанных (errors + unparsed)", "Значение": total_errors + total_unparsed},
         {"Параметр": "Не расшифровано (not_found)", "Значение": total_not_found},
         {"Параметр": "Анонимных записей (anonymous)", "Значение": total_anon},
+        {"Параметр": "Исключено записей без reactor_id", "Значение": skipped_no_id},
         {"Параметр": "Результат неполный", "Значение": "Да" if is_incomplete else "Нет"},
     ]
     df_summary = pd.DataFrame(summary_data)
@@ -374,7 +400,7 @@ def export_donors_summary(
         _style_summary_worksheet(writer.sheets[INFO_SHEET_NAME], df_summary)
 
     logger.info("Excel-отчёт бота сохранён: %s (донатов: %d, донатеров: %d)",
-                path, total_donations, len(donors))
+                path, total_donations, len(kept_donors))
     return str(path)
 
 
@@ -461,6 +487,6 @@ __all__ = [
     "DONATION_COLUMNS", "DONATION_HEADERS", "DONATIONS_SHEET_NAME", "DONOR_COLUMNS",
     "DONOR_HEADERS", "DONORS_SHEET_NAME", "INFO_SHEET_NAME",
     "build_dataframe", "build_donation_rows", "build_result_filename",
-    "export_donors_summary", "export_records", "safe_filename", "unique_path",
-    "write_excel",
+    "export_donors_summary", "export_records", "is_resolvable_reactor",
+    "safe_filename", "unique_path", "write_excel",
 ]

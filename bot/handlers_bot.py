@@ -26,6 +26,12 @@ from telethon import TelegramClient
 
 from bot.aggregate import aggregate_star_records
 from bot.config_bot import BotConfig
+from bot.donor_search import (
+    build_donor_report,
+    format_search_summary,
+    parse_donor_query,
+    search_donor,
+)
 from bot.formatting import format_donors_table, format_queue_summary
 from bot.queue_service import (
     QueueService,
@@ -83,6 +89,12 @@ class AdminState(StatesGroup):
     DEL_USER = State()
 
 
+class DonorSearchState(StatesGroup):
+    """Ожидание id/username для поиска донора по сохранённым отчётам."""
+
+    QUERY = State()
+
+
 # Управление таймаутами бездействия
 _user_idle_tasks: dict[int, asyncio.Task] = {}
 
@@ -128,6 +140,7 @@ def _main_keyboard(admin: bool) -> InlineKeyboardMarkup:
     """Клавиатура главного меню."""
     rows = [
         [InlineKeyboardButton(text="🚀 Запустить парсинг", callback_data="wiz:start")],
+        [InlineKeyboardButton(text="🔎 Найти донора", callback_data="donor:search")],
         [
             InlineKeyboardButton(text="📈 Моя задача", callback_data="wiz:status"),
             InlineKeyboardButton(text="🕒 Очередь", callback_data="wiz:queue"),
@@ -162,6 +175,7 @@ def _help_text(admin: bool = False) -> str:
         "",
         "<b>Команды</b>",
         "• /parse [каналы] — запустить парсинг",
+        "• /donor [id|@username] — найти донора в сохранённых отчётах",
         "• /status — прогресс вашей задачи",
         "• /queue — очередь задач",
         "• /cancel — отменить диалог или задачу",
@@ -192,7 +206,8 @@ async def cmd_start(message: Message, state: FSMContext, bot_config: BotConfig) 
         "Собираю, кто и сколько звёзд отправил на посты канала, и отдаю готовый "
         "Excel: <b>каждый донат отдельной строкой</b> — канал, ссылка на пост, "
         "username, id и количество звёзд.\n\n"
-        "Нажмите «🚀 Запустить парсинг» или пришлите /parse."
+        "Нажмите «🚀 Запустить парсинг» или пришлите /parse.\n\n"
+        "Уже собранные отчёты можно искать по донору: «🔎 Найти донора» или /donor."
     )
     await message.answer(text, parse_mode="HTML", reply_markup=_main_keyboard(admin))
 
@@ -217,6 +232,103 @@ async def cb_help(callback: CallbackQuery, bot_config: BotConfig) -> None:
     except TelegramBadRequest:
         await callback.message.answer(_help_text(is_admin(callback.from_user.id, bot_config)),
                                       parse_mode="HTML")
+
+
+# --------------------------------------------------------------------------- #
+# Поиск донора по сохранённым Excel-отчётам
+# --------------------------------------------------------------------------- #
+DONOR_SEARCH_STEP_TEXT = (
+    "🔎 <b>Поиск донора</b>\n\n"
+    "Пришлите <b>id</b> или <b>@username</b> донора — поищу его во всех сохранённых "
+    "Excel-отчётах и соберу отдельный файл с разбивкой по каналам.\n\n"
+    "Примеры: <code>123456789</code>, <code>@username</code>.\n"
+    "<i>Отмена — кнопка ниже.</i>"
+)
+
+MAX_SENT_FILE_SIZE = 50 * 1024 * 1024  # 50 MB — лимит Telegram для документов
+
+
+@router.message(Command("donor"))
+async def cmd_donor(message: Message, state: FSMContext, bot_config: BotConfig) -> None:
+    """`/donor [id|@username]`: поиск донора по уже сохранённым отчётам."""
+    raw_query = (message.text or "").partition(" ")[2].strip()
+    if raw_query:
+        await _run_donor_search(message, raw_query, bot_config)
+        return
+
+    await state.set_state(DonorSearchState.QUERY)
+    await message.answer(
+        DONOR_SEARCH_STEP_TEXT, parse_mode="HTML", reply_markup=_cancel_keyboard(),
+    )
+
+
+@router.callback_query(F.data == "donor:search")
+async def cb_donor_search(
+    callback: CallbackQuery, state: FSMContext, bot_config: BotConfig
+) -> None:
+    """Кнопка «🔎 Найти донора» в главном меню."""
+    _cancel_user_idle_timer(callback.from_user.id)
+    await state.clear()
+    await state.set_state(DonorSearchState.QUERY)
+    await callback.answer()
+    try:
+        await callback.message.edit_text(
+            DONOR_SEARCH_STEP_TEXT, parse_mode="HTML", reply_markup=_cancel_keyboard(),
+        )
+    except TelegramBadRequest:
+        await callback.message.answer(
+            DONOR_SEARCH_STEP_TEXT, parse_mode="HTML", reply_markup=_cancel_keyboard(),
+        )
+
+
+async def _run_donor_search(message: Message, raw_query: str, bot_config: BotConfig) -> None:
+    """Ищет донора по всем .xlsx в `output/` и присылает `<...>_парсинг.xlsx`."""
+    try:
+        parse_donor_query(raw_query)
+    except ValueError as exc:
+        await message.answer(f"⚠️ {html.escape(str(exc))}", parse_mode="HTML")
+        return
+
+    status = await message.answer("🔎 Ищу донора в сохранённых Excel-отчётах…")
+    out_dir = Path("output")
+
+    try:
+        result = await asyncio.to_thread(search_donor, raw_query, out_dir)
+    except Exception as exc:  # noqa: BLE001 - пользователю нужен понятный ответ
+        logger.exception("Ошибка поиска донора: %s", exc)
+        await status.edit_text("❌ Не удалось выполнить поиск. Подробности — в логах.")
+        return
+
+    summary = format_search_summary(result)
+    if not result.rows:
+        await status.edit_text(summary, parse_mode="HTML")
+        return
+
+    try:
+        report_path = await asyncio.to_thread(build_donor_report, result, out_dir)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Ошибка формирования отчёта по донору: %s", exc)
+        report_path = None
+
+    await status.edit_text(summary, parse_mode="HTML")
+
+    if report_path is None:
+        return
+
+    file_size = report_path.stat().st_size if report_path.exists() else 0
+    if bot_config.send_files and 0 < file_size <= MAX_SENT_FILE_SIZE:
+        await message.answer_document(
+            FSInputFile(str(report_path)),
+            caption=f"📄 Отчёт по донору: {html.escape(result.report_name)}",
+        )
+    else:
+        reason = ("размер превышает 50 МБ" if file_size > MAX_SENT_FILE_SIZE
+                  else "отключена отправка файлов")
+        await message.answer(
+            f"📁 Файл сохранён на сервере ({reason}):\n"
+            f"<code>{html.escape(str(report_path.resolve()))}</code>",
+            parse_mode="HTML",
+        )
 
 
 @router.callback_query(F.data == "wiz:start")
@@ -1506,3 +1618,18 @@ async def _send_final_results(
                 f"📁 Детализированный файл:\n<code>{html.escape(str(detailed_path.resolve()))}</code>",
                 parse_mode="HTML",
             )
+
+
+# --------------------------------------------------------------------------- #
+# Ввод id/username для поиска донора (регистрируется последним)
+# --------------------------------------------------------------------------- #
+@router.message(DonorSearchState.QUERY)
+async def process_donor_query(message: Message, state: FSMContext, bot_config: BotConfig) -> None:
+    """Принимает id/username после кнопки «🔎 Найти донора» или `/donor`.
+
+    Хендлер ловит любой текст, поэтому регистрируется в самом конце модуля:
+    иначе он перехватывал бы команды (/status, /parse, /admin и т.д.).
+    """
+    await state.clear()
+    await _run_donor_search(message, message.text or "", bot_config)
+

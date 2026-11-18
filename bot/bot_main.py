@@ -9,6 +9,7 @@ from pathlib import Path
 
 from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import BotCommand
 from telethon import TelegramClient
 
 from bot.access import AccessMiddleware
@@ -91,6 +92,22 @@ async def main() -> None:
     dp.callback_query.middleware(access_middleware)
 
     dp.include_router(router)
+
+    # Меню команд в клиенте Telegram (кнопка «/» и подсказки при вводе)
+    try:
+        await bot.set_my_commands(
+            [
+                BotCommand(command="start", description="Главное меню"),
+                BotCommand(command="parse", description="Запустить парсинг каналов"),
+                BotCommand(command="donor", description="Найти донора по id или username"),
+                BotCommand(command="status", description="Прогресс моей задачи"),
+                BotCommand(command="queue", description="Очередь задач"),
+                BotCommand(command="cancel", description="Отменить диалог или задачу"),
+                BotCommand(command="help", description="Справка"),
+            ]
+        )
+    except Exception as exc:  # noqa: BLE001 - меню не критично для работы бота
+        logger.warning("Не удалось зарегистрировать меню команд: %s", exc)
 
     logger.info(
         "Бот запускается... доступ: %d из conf.ini + %d добавленных, администраторов: %d",
